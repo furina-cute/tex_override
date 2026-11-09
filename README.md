@@ -159,4 +159,4 @@ C++17 / MSVC（Win32 或 x64，与 ReShade 架构一致）
 
 ## 许可
 
-MIT
+[MIT](https://github.com/furina-cute/tex_override/blob/main/LICENSE)

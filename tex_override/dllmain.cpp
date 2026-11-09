@@ -97,8 +97,10 @@
  *       3) 用 index_by_texture_hash 取候选，再校验 stable anchors / 几何参数。
  *
  *   push_descriptors 侧：
- *     - 规则集里没有纹理规则时（例如全部 hash = *），回调开头直接 return，
+ *     - 规则集里没有纹理规则、且不在狩猎采集时，回调开头直接 return，
  *       完全不记录 stage_bindings；
+ *     - 狩猎采集期间（g_hunting_collecting）即使只有 hash = * 规则也照常记录，
+ *       否则候选列表永远是空的；采集结束后自动恢复零开销；
  *     - 有纹理规则时只写 resource_view 句柄，绝不计算任何哈希；
  *     - 阶段匹配用 shader_stage 位标志遍历，完整覆盖 VS/HS/DS/GS/PS/CS。
  *
@@ -949,6 +951,10 @@ static device_data *get_device_data(device *dev)
 
 // 规则集里是否存在需要纹理哈希的规则：push_descriptors 的最快出口
 static std::atomic<bool> g_texture_rules_active{ false };
+
+// 狩猎采集进行中：即使没有纹理规则，也必须记录 stage_bindings，
+// 否则候选列表永远是空的（纯 hash = * 配置下的常见场景）。
+static std::atomic<bool> g_hunting_collecting{ false };
 
 // push_descriptors 计数（诊断，不依赖 device_data）
 static std::atomic<uint64_t> g_push_updates{ 0 };
@@ -2034,8 +2040,10 @@ static void on_push_descriptors(
 	uint32_t /*param_index*/,
 	const descriptor_table_update &update)
 {
-	// 没有任何规则需要纹理哈希 -> 完全不需要 SRV 绑定信息
-	if (!g_texture_rules_active.load(std::memory_order_relaxed))
+	// 没有纹理规则、也不在狩猎采集 -> 完全不需要 SRV 绑定信息。
+	// 纯 hash = * 配置下，狩猎模式必须继续记录 stage_bindings，否则候选列表为空。
+	if (!g_texture_rules_active.load(std::memory_order_relaxed) &&
+		!g_hunting_collecting.load(std::memory_order_relaxed))
 		return;
 
 	if (update.type != descriptor_type::shader_resource_view &&
@@ -2692,6 +2700,9 @@ static void restart_candidate_collection(device_data *data)
 	data->frames_collected.store(0, std::memory_order_relaxed);
 	data->collecting.store(true, std::memory_order_relaxed);
 
+	// 让 push_descriptors 开始记录 SRV 绑定（没有纹理规则时也需要）
+	g_hunting_collecting.store(true, std::memory_order_relaxed);
+
 	log_info("[Hunting] candidate collection restarted");
 }
 
@@ -2781,6 +2792,7 @@ static void on_present(
 			data->candidate_index = -1;
 			data->frames_collected.store(0, std::memory_order_relaxed);
 			data->collecting.store(false, std::memory_order_relaxed);
+			g_hunting_collecting.store(false, std::memory_order_relaxed);
 			return;
 		}
 
@@ -2830,6 +2842,8 @@ static void on_present(
 		{
 			data->collecting.store(false, std::memory_order_relaxed);
 			data->frame_candidates.clear();
+			// 采集结束：push_descriptors 可以恢复极速早退
+			g_hunting_collecting.store(false, std::memory_order_relaxed);
 
 			char message[128];
 			std::snprintf(message, sizeof(message),
@@ -3426,6 +3440,7 @@ static void draw_overlay(effect_runtime *runtime)
 			data->candidate_index = -1;
 			data->frames_collected.store(0, std::memory_order_relaxed);
 			data->collecting.store(false, std::memory_order_relaxed);
+			g_hunting_collecting.store(false, std::memory_order_relaxed);
 		}
 	}
 
@@ -3445,6 +3460,7 @@ static void draw_overlay(effect_runtime *runtime)
 			data->candidate_index = -1;
 			data->frames_collected.store(0, std::memory_order_relaxed);
 			data->collecting.store(false, std::memory_order_relaxed);
+			g_hunting_collecting.store(false, std::memory_order_relaxed);
 		}
 
 		if (data->hunting.load(std::memory_order_relaxed))

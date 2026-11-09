@@ -1,5 +1,10 @@
 # 贴图覆盖 (INI规则)
 
+**[Chinese](https://github.com/furina-cute/tex_override/blob/main/README_zh.md)**
+
+**[English](https://github.com/furina-cute/tex_override/blob/main/README.md)**
+
+---
 一个由 INI 驱动的 [ReShade](https://reshade.me) 附加组件，用来按纹理哈希、着色器字节码哈希与绘制几何上下文组合匹配绘制调用，并执行 **skip**（跳过绘制）或 **replace**（替换纹理为 1×1 透明）。
 
 面向 D3D11 引擎的动态图集场景：纹理描述符哈希跨会话会漂移，但着色器字节码哈希不会。

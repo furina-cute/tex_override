@@ -1,77 +1,75 @@
 # Texture Override (INI Rules)
 
-一个由 INI 驱动的 [ReShade](https://reshade.me) 附加组件，用来按纹理哈希、着色器字节码哈希与绘制几何上下文组合匹配绘制调用，并执行 **skip**（跳过绘制）或 **replace**（替换纹理为 1×1 透明）。
+---
+**[Chinese](https://github.com/furina-cute/tex_override/blob/main/README_zh.md)**
 
-面向 D3D11 引擎的动态图集场景：纹理描述符哈希跨会话会漂移，但着色器字节码哈希不会。
+**[English](https://github.com/furina-cute/tex_override/blob/main/README.md)**
 
 ---
+A [ReShade](https://reshade.me) injectable driven by INI rules, designed to match draw calls by texture hash, shader bytecode hash, and draw geometry context combination, and perform **skip** (skip the draw call) or **replace** (replace texture with 1x1 transparent).
 
-## 特性
+Targeting D3D11 dynamic atlas scenes: texture descriptor hash drifts across sessions, but shader bytecode hash remains stable.
 
-- **多维度复合匹配** — 条件之间是 AND，规则之间是 OR（按 `match_priority` 取优先）
-  - 纹理哈希（descriptor 或 pixel 内容哈希，可写 `*` 通配）
-  - **像素 / 顶点着色器字节码哈希**（跨会话稳定锚点）
-  - `first_index` / `index_count` 几何范围
-- **跨会话稳定的着色器哈希** — 对 DXBC 容器的 chunk 做 CRC32C，跳过 MD5 校验和、偏移表与总大小；同一份 shader 资源任意次重启结果相同
-- **两条匹配路径**
-  - 快速通道：`hash = *` 规则只需着色器 + 几何条件，完全不读取 SRV 列表
-  - 慢速通道：仅在存在纹理哈希规则时才遍历活跃 SRV，哈希按需计算并按线程缓存
-- **Hunting Mode** — 运行中采集候选（纹理哈希 + PS/V 哈希 + 几何参数），小键盘一键生成/删除规则
-- **零热路径开销** — `bind_pipeline` / `push_descriptors` / `draw_indexed` 均为无锁、无分配、无 atomic RMW（计数器在 present 时汇总）
-- **ImGui 面板** — 实时统计、候选列表、规则表格、规则设置编辑、HUD 悬浮窗
+## Features
 
----
+- **Multi-dimensional composite matching** — Conditions within a rule are AND; rules themselves are OR (prioritized by `match_priority`)
+  - Texture hash (descriptor or pixel content hash, can write `*` as wildcard)
+  - **Pixel / vertex shader bytecode hash** (stable cross-session anchor)
+  - `first_index` / `index_count` geometric range
+- **Cross-session stable shader hash** — CRC32C on DXBC chunk `fourCC + size + payload`, skipping MD5 checksum, offset table and total size; same shader resource re-packed gives identical result across restarts
+- **Two matching paths**
+  - Fast path: `hash = *` rules only need shader + geometric conditions, completely bypass SRV list reading
+  - Slow path: only traverses active SRV when texture hash rules exist; hashes computed on-demand and thread-cached
+- **Hunting Mode** — In-run collection of candidates (texture hash + PS/VS hash + geometric parameters), NumPad one-click generate/delete rules
+- **Zero hot-path overhead** — `bind_pipeline` / `push_descriptors` / `draw_indexed` are lock-free, allocation-free, no atomic RMW (counters summarized at present)
+- **ImGui panel** — Real-time stats, candidate list, rule table, rule settings editor, HUD overlay
 
-## 安装
+## Installation
 
-1. 安装 **ReShade 6.8.0**（附加组件 API v20）
-2. 将编译好的 `tex_override.addon64`（或 `.addon32`）放入游戏目录下 ReShade 的 `addons` 文件夹
-3. 启动游戏，在 ReShade 叠加层中启用 **Texture Override**
-4. 配置文件 `TextureOverride.ini` 会读取自 **宿主可执行文件所在目录**
+1. Install **ReShade 6.8.0** (Add-on API v20)
+2. Place the compiled `tex_override.addon64` (or `.addon32`) into the game's ReShade `addons` folder
+3. Launch the game, enable **Texture Override** in the ReShade overlay
+4. Configuration file `TextureOverride.ini` reads from the **host executable's directory**
 
-> ⚠️ 仅在 **Direct3D 11** 上支持 `replace`；D3D12/Vulkan 下 `replace` 会降级为 `skip` 并输出一次警告，着色器哈希与 `skip` 仍可用。
+> ⚠️ **Direct3D 11 only** supports `replace`; D3D12/Vulkan will downgrade to `skip` and output a single warning; shader hash and `skip` still work.
 
----
-
-## 配置语法
+## Configuration Syntax
 
 ```ini
 [Settings]
-hash_mode = descriptor      ; descriptor (快) | pixel (精确，仅 CPU 上传的纹理有哈希)
+hash_mode = descriptor      ; descriptor (fast) | pixel (exact, only textures uploaded to CPU have hash)
 
 [TextureOverride_Example]
-hash = 0x83fd403f           ; 纹理哈希；写 * 表示任意纹理（可省略）
-match_ps_hash = 0x1A2B3C4D  ; 可选，像素着色器字节码 CRC32C
-match_vs_hash = 0x5E6F7A8B  ; 可选，顶点着色器字节码 CRC32C
-match_first_index = 0       ; 可选，DrawIndexed.StartIndexLocation，支持 0 / 0,512 / 100-500 / 100- / -500 / *
-match_index_count = 420     ; 可选，DrawIndexed.IndexCount
-match_priority = 1          ; 可选，越大越优先（默认 0）
+hash = 0x83fd403f           ; texture hash; write * for any texture (optional)
+match_ps_hash = 0x1A2B3C4D  ; optional, pixel shader bytecode CRC32C
+match_vs_hash = 0x5E6F7A8B  ; optional, vertex shader bytecode CRC32C
+match_first_index = 0       ; optional, DrawIndexed.StartIndexLocation, supports 0 / 0,512 / 100-500 / 100- / -500 / *
+match_index_count = 420     ; optional, DrawIndexed.IndexCount
+match_priority = 1          ; optional, higher is more prioritized (default 0)
 handling = skip             ; skip | replace
-active = 1                  ; 0 关闭该规则
+active = 1                  ; 0 disable this rule
 ```
 
-### 布尔逻辑
+### Boolean Logic
 
-- **同一规则内**：所有写出的条件为 **AND**；未写出的条件视为通配。
-- **不同规则间**：**OR**，按 `match_priority` 取最大者；同优先级取文件中靠前者。
-- **安全约束**：规则至少要写 `hash` / `match_ps_hash` / `match_vs_hash` 之一。
-- 纯 `hash = *` 且无着色器条件会被拒绝加载，避免误伤整个场景。
-- `hash = *` 的 `replace` 会在加载时降级为 `skip`（无法确定替换目标）。
+- **Within a single rule**: all written conditions are **AND**; unspecified conditions act as wildcard.
+- **Between different rules**: **OR**, pick the maximum by `match_priority`; same priority picks the one appearing first in the file.
+- **Safety constraint**: at least one of `hash` / `match_ps_hash` / `match_vs_hash` must be written.
+- Pure `hash = *` with no shader conditions will be **rejected on load**, to prevent accidental scene-wide matching.
+- `hash = *` with `replace` degrades to `skip` at load time (cannot determine replacement target).
 
-### 键名别名
+### Key Aliases
 
-| 标准键名 | 兼容别名 |
+| Standard Key | Compatible Alias |
 | --- | --- |
 | `hash` | `match_hash`, `match_texture_hash` |
 | `match_ps_hash` | `match_pixel_shader_hash`, `ps_hash` |
 | `match_vs_hash` | `match_vertex_shader_hash`, `vs_hash` |
 | `handling = replace` | `handling = null` |
 
----
+## Examples
 
-## 示例
-
-**只靠稳定锚点，跨会话永不失效（推荐）：**
+**Anchor-only, never invalid across sessions (recommended):**
 
 ```ini
 [TextureOverride_UI_Icon]
@@ -82,7 +80,7 @@ match_index_count = 6
 handling = skip
 ```
 
-**精确匹配特定纹理：**
+**Exact match for a specific texture:**
 
 ```ini
 [TextureOverride_Bloom_Texture]
@@ -90,73 +88,63 @@ hash = 0x83FD403F
 handling = replace
 ```
 
----
-
 ## Hunting Mode
 
-面板勾选 **Hunting Mode** 后：
+With **Hunting Mode** checked in the panel:
 
-| 热键 | 动作 |
+| Key | Action |
 | --- | --- |
-| `Numpad 1` | 上一个候选 |
-| `Numpad 2` | 下一个候选 |
-| `Numpad 3` | 为当前候选添加 / 删除规则 |
+| `Numpad 1` | Previous candidate |
+| `Numpad 2` | Next candidate |
+| `Numpad 3` | Add / remove rule for current candidate |
 
-- 候选 = `(纹理哈希, PS 哈希, VS 哈希)` 三元组，同时展示 `first_index` / `index_count`
-- 默认勾选 **Stable-only new rules**：生成规则时写 `hash = *`，只保留稳定锚点
-- 关闭该选项则写入纹理哈希，做精确定位
-- 采集 N 帧（默认 10，可调 1–120）后暂停并冻结候选列表
+- Candidate = `(texture hash, PS hash, VS hash)` triad, also shows `first_index` / `index_count`
+- Default **Stable-only new rules** checked: generates rules with `hash = *`, keeping only stable anchors
+- Disabled: writes texture hash for precise localization
+- After collecting N frames (default 10,可调 1–120) the list pauses and freezes
 
----
+## Hash Notes
 
-## 哈希说明
+### Shader Bytecode Hash (cross-session stable)
 
-### 着色器字节码哈希（跨会话稳定）
-
-不直接 CRC 整个 DXBC：容器头含 16 字节 MD5 校验和（部分引擎还写时间戳），重新打包后会变。本插件解析容器，**只对每个 chunk 的 `fourCC + size + payload` 做 CRC32C**。
+Do not CRC the entire DXBC: the container header contains a 16-byte MD5 checksum (some engines also write timestamps), which changes on re-packaging. This plugin parses the container, **only CRC32C on each chunk's `fourCC + size + payload`**.
 
 ```
-DXBC 容器布局：
+DXBC Container Layout:
 0x00 'DXBC'
-0x04 checksum[16]          ← 跳过
+0x04 checksum[16]          ← skip
 0x14 unknown
 0x18 total_size
 0x1C chunk_count
-0x20 chunk_offsets[...]    ← 跳过
-     每个 chunk: fourCC + size + payload   ← 参与哈希
+0x20 chunk_offsets[...]    ← skip
+     Each chunk: fourCC + size + payload   ← participates in hash
 ```
 
-容器结构异常时退化为「跳过前 20 字节」；非 DXBC（例如裸 DXIL）整体哈希。
+If container structure is abnormal, degrades to "skip first 20 bytes"; non-DXBC (e.g. raw DXIL) whole-hash.
 
-### 纹理哈希
+### Texture Hash
 
-- **descriptor**：`CRC32C(Width_Height_Format_MipLevels_ArraySize)`，快速但图集重排后可能漂移
-- **pixel**：对纹理内容做 CRC32C，在 `init_resource` / `update_texture_region` 的 CPU 上传阶段计算，每张纹理最多扫描 512 KiB（超出按固定步长抽行），**绝不回读 GPU**
+- **descriptor**: `CRC32C(Width_Height_Format_MipLevels_ArraySize)`, fast but may drift after atlas reordering
+- **pixel**: CRC32C on texture content, computed at CPU upload stage in `init_resource` / `update_texture_region`, each texture scans at most 512 KiB (beyond fixed-stride row skipping), **never reads from GPU**
 
----
+## Building
 
-## 构建
-
-需要一个 ReShade 附加组件开发环境（`reshade.hpp`、ImGui 与 ReShade 附加组件 API v20）。
+Requires a ReShade add-on development environment (`reshade.hpp`, ImGui, and ReShade Add-on SDK v20).
 
 ```
-C++17 / MSVC（Win32 或 x64，与 ReShade 架构一致）
-依赖：ReShade Add-on SDK 6.8.0
+C++17 / MSVC (Win32 or x64, consistent with ReShade architecture)
+Dependencies: ReShade Add-on SDK 6.8.0
 ```
 
-在 `DllMain` 中通过 `reshade::register_addon` 注册，并挂接 `init_device` / `draw_indexed` / `push_descriptors` / `present` 等事件。
+Registered via `reshade::register_addon` in `DllMain`, and hook `init_device` / `draw_indexed` / `push_descriptors` / `present` events.
 
----
+## Known Limitations
 
-## 已知限制
+- `replace` only supports **D3D11** (other APIs downgrade to `skip`)
+- `hash = *` cannot determine replacement target, can only `skip`
+- Pixel hash only covers textures uploaded via CPU; GPU-direct written textures have no hash
+- Panel's `Draws` statistic counts **draw calls entering the matching flow** (non-empty rule set or hunting mode active), **not** the engine's total draw call count
 
-- `replace` 仅支持 **D3D11**（其它 API 降级为 `skip`）
-- `hash = *` 无法确定替换目标，只能 `skip`
-- pixel 哈希只覆盖通过 CPU 上传的纹理；GPU 直写纹理没有哈希
-- 面板中的 `Draws` 统计的是**进入匹配流程的绘制**（规则集非空或采集开启时），不是引擎的全量 Draw Call 数
-
----
-
-## 许可
+## License
 
 [MIT](https://github.com/furina-cute/tex_override/blob/main/LICENSE)

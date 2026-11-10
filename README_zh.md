@@ -177,13 +177,14 @@ tex_override\bin\x64\Release\tex_override.addon64
 - Hunting 控制区：`Hunting Mode` 勾选、`Frames to collect` 滑块（1–120）、`Refresh`。
 - `Stable-only new rules (hash = *)`：勾选时 Numpad 3 生成不依赖纹理哈希的规则（默认开启）。
 - `Pixel hashes: N texture(s), X MB hashed`：像素哈希采集情况；为 0 时会提示原因。
-- 候选列表：进入 Hunting 后累积 `Frames to collect` 帧的候选并集，随后**冻结**；每条候选显示 `纹理哈希 / PS 哈希 / VS 哈希 / fi / ic`。
+- 候选列表：进入 Hunting 后累积 `Frames to collect` 帧的候选并集，随后**冻结**。行内只显示 `纹理哈希 + fi/ic`，`ps/vs` 收进悬停 Tooltip；当前选中且预览开启的行用黄色 `[Hidden]` 前缀标记（与 HUD 的 `PREVIEW` 徽标对应）。
   - **点选即预览**：点某一行（或用 Numpad 1/2 步进）会立刻把该候选对应的绘制**隐藏**，用"元素消失"确认它是哪一块画面，再按 Numpad 3 落规则。开关是候选列表上方的 `Preview selected (hide it live)`（默认开）；旁边的 `preview hidden: N draw(s)` 是预览跳过的绘制数（不计入 `Skipped`）。
-- `List of Toggle Groups`（对齐 ShaderToggler 的行式列表，默认展开）：每行是 `X | [序号] | Active 勾选 | Edit | Find | 组名 (热键, is active)`。
-  - `Edit` 打开 `Group settings`；`Find` 会开启 Hunting 并重新采集，随后用 Numpad 1/2 找元素、Numpad 3 增删该组的匹配项。
-  - 组名来自 INI 的 `name =`（`Save to INI` 会写回），没名字时显示 `<unnamed>`。
-- `Rule details`：原始哈希表 `Tex / PS / VS / FI / IC / Key / Mode / Act / Set / Del`（排查用；日常操作走上面的列表）。
-- 底部：`Save to INI` / `Reload from INI`；存在未保存修改时显示黄色 `(Unsaved)`。
+- `List of Toggle Groups`（表格布局，默认展开）：列依次是 `# | Act | Edit | Hunt | Group | Key | X`。
+  - `X` 放在**最右**，避免紧挨着 `Edit` 误触；`Hunt` 只开启 Hunting，**不会**重启采集清空候选列表。
+  - `Key` 列右对齐；没有绑定时显示暗灰 `[No Key]`。
+  - 组名来自 INI 的 `name =`（`Save to INI` 会写回），没名字时显示 `<unnamed>`，被禁用的组会追加 `(disabled)`。
+- `Debug: rule details`（默认**折叠**）：只读的原始哈希表 `Tex / PS / VS / FI / IC / Key / Mode`（FI 与 IC 合并为一列以免横向溢出）。增删改统一走上面的 Toggle Groups，这里不再重复提供按钮。
+- 底部：`Save to INI` / `Reload from INI`；存在未保存修改时标签显示 `(Unsaved)`，**窗口标题追加 `*`**，且点 `Reload from INI` 会弹二次确认（`Reload` / `Cancel`）。
 - 窗口默认尺寸会随分辨率收缩（屏幕高 < 600 或宽 < 800 时按 0.8 缩放）。
 
 `Group settings` 独立窗口（点击行内 `Settings` / 列表里的 `Edit` 打开）：字段区可滚动，含 `name`、`hash`（支持 `*`）、`match_ps_hash`、`match_vs_hash`、`match_first_index`、`match_index_count`、`match_priority`、`handling`、`Active`、`hotkey`（`Capture shortcut` / `Clear` / `Cancel capture`），点 `Done` 应用并关闭。

@@ -4402,6 +4402,7 @@ static void draw_overlay(effect_runtime *runtime)
 		bool stable_only = true;
 		bool safe_mode = false;
 		bool preview_enabled = true;
+		bool has_unsaved = false;
 		uint32_t preview_skipped = 0;
 		uint32_t resolved = 0;
 		uint32_t applied = 0;
@@ -4432,6 +4433,7 @@ static void draw_overlay(effect_runtime *runtime)
 		snapshot.stable_only = data->stable_only_rules.load(std::memory_order_relaxed);
 		snapshot.safe_mode = data->safe_mode.load(std::memory_order_relaxed);
 		snapshot.preview_enabled = data->preview_enabled.load(std::memory_order_relaxed);
+		snapshot.has_unsaved = data->has_unsaved_changes.load(std::memory_order_relaxed);
 		snapshot.preview_skipped = data->preview_skipped.load(std::memory_order_relaxed);
 		snapshot.resolved = data->srv_resolved.load(std::memory_order_relaxed);
 		snapshot.applied = data->rules_applied.load(std::memory_order_relaxed);
@@ -4505,7 +4507,12 @@ static void draw_overlay(effect_runtime *runtime)
 		std::min(600.0f * ui_scale, std::max(260.0f, display_size.y - 48.0f)));
 
 	ImGui::SetNextWindowSize(main_window_size, ImGuiCond_FirstUseEver);
-	if (ImGui::Begin("Texture Override", nullptr))
+	// 标题带未保存标记；"###" 之后是稳定的窗口 ID，避免标记变化导致窗口位置/停靠重置
+	char main_title[64];
+	std::snprintf(main_title, sizeof(main_title), "%s###texovr_main",
+		snapshot.has_unsaved ? "Texture Override *" : "Texture Override");
+
+	if (ImGui::Begin(main_title, nullptr))
 	{
 		ImGui::Text("Draws: %u   Skipped: %u   Rules applied: %u",
 			snapshot.draws, snapshot.skipped, snapshot.applied);
@@ -4651,17 +4658,39 @@ static void draw_overlay(effect_runtime *runtime)
 			for (int i = 0; i < candidate_count; ++i)
 			{
 				const candidate &entry = snapshot.candidates[i];
+				const bool is_selected = (i == view_index);
+				// 选中 + 预览开启 = 当前正被临时隐藏（与 HUD 的 PREVIEW 徽标一致）
+				const bool is_hidden = is_selected && snapshot.preview_enabled;
 
 				ImGui::PushID(i);
-				char label[160];
-				std::snprintf(label, sizeof(label),
-					"%s0x%08X  ps=%08X vs=%08X  fi=%u ic=%u",
-					(i == view_index) ? "> " : "  ",
-					entry.hash, entry.ps_hash, entry.vs_hash,
-					entry.first_index, entry.index_count);
 
-				if (ImGui::Selectable(label, i == view_index))
+				// 行内只保留定位必需的信息，ps/vs 挪到 tooltip，避免列表被撑宽
+				char label[96];
+				std::snprintf(label, sizeof(label), "%s0x%08X  fi=%u ic=%u",
+					is_hidden ? "[Hidden] " : (is_selected ? "> " : "  "),
+					entry.hash, entry.first_index, entry.index_count);
+
+				if (is_hidden)
+					ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.3f, 1.0f));
+
+				if (ImGui::Selectable(label, is_selected))
 					select_local(i);
+
+				if (is_hidden)
+					ImGui::PopStyleColor();
+
+				if (ImGui::IsItemHovered())
+				{
+					ImGui::BeginTooltip();
+					ImGui::Text("tex: 0x%08X", entry.hash);
+					ImGui::Text("ps:  0x%08X", entry.ps_hash);
+					ImGui::Text("vs:  0x%08X", entry.vs_hash);
+					ImGui::Text("first_index=%u  index_count=%u", entry.first_index, entry.index_count);
+					if (is_hidden)
+						ImGui::TextDisabled("(previewing: this element is currently hidden)");
+					ImGui::EndTooltip();
+				}
+
 				ImGui::PopID();
 			}
 
@@ -4681,51 +4710,99 @@ static void draw_overlay(effect_runtime *runtime)
 
 		// ---- List of Toggle Groups（对齐 ShaderToggler 的行式列表）----
 		// 组的来源就是规则：Hunting（Numpad 3）建组，或手写 INI。
+		// 布局用表格：X 放最右（防误触），热键列右对齐，组名拉伸。
 		if (ImGui::CollapsingHeader("List of Toggle Groups", ImGuiTreeNodeFlags_DefaultOpen))
 		{
 			ImGui::TextDisabled("Groups are created with Hunting Mode (Numpad 3) or by editing the INI.");
 
 			ImGui::BeginChild("##groups", ImVec2(0.0f, 150.0f), true);
 
-			for (int i = 0; i < static_cast<int>(snapshot.rules.size()); ++i)
+			const ImGuiTableFlags group_table_flags =
+				ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoPadOuterX;
+
+			if (ImGui::BeginTable("##group_table", 7, group_table_flags))
 			{
-				const texture_override_rule &rule = snapshot.rules[i];
-				ImGui::PushID(2000 + i);
+				ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 26.0f);
+				ImGui::TableSetupColumn("Act", ImGuiTableColumnFlags_WidthFixed, 26.0f);
+				ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 44.0f);   // Edit
+				ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 46.0f);   // Hunt
+				ImGui::TableSetupColumn("Group", ImGuiTableColumnFlags_WidthStretch);
+				ImGui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+				ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 26.0f);   // X（最右，防误触）
+				ImGui::TableHeadersRow();
 
-				if (ImGui::Button("X"))
-					remove_index = i;
-
-				ImGui::SameLine();
-				ImGui::Text("[%d]", i);
-
-				ImGui::SameLine();
-				bool group_active = rule.active;
-				if (ImGui::Checkbox("##group_active", &group_active))
+				for (int i = 0; i < static_cast<int>(snapshot.rules.size()); ++i)
 				{
-					active_index = i;
-					active_value = group_active;
+					const texture_override_rule &rule = snapshot.rules[i];
+					ImGui::PushID(2000 + i);
+					ImGui::TableNextRow();
+
+					ImGui::TableSetColumnIndex(0);
+					ImGui::Text("%d", i);
+
+					ImGui::TableSetColumnIndex(1);
+					bool group_active = rule.active;
+					if (ImGui::Checkbox("##group_active", &group_active))
+					{
+						active_index = i;
+						active_value = group_active;
+					}
+
+					ImGui::TableSetColumnIndex(2);
+					if (ImGui::Button("Edit"))
+						open_settings_index = i;
+
+					ImGui::TableSetColumnIndex(3);
+					if (ImGui::Button("Hunt"))
+					{
+						// 只开启 Hunting，**不** restart_candidate_collection：
+						// 之前叫 Find 且顺手重启采集，误触一次就把候选列表清空了。
+						if (!snapshot.hunting)
+						{
+							hunting_value = true;
+							hunting_changed = true;
+						}
+					}
+					if (ImGui::IsItemHovered())
+						ImGui::SetTooltip("Enable Hunting Mode (keeps the current candidate list)");
+
+					ImGui::TableSetColumnIndex(4);
+					ImGui::TextUnformatted(rule.name.empty() ? "<unnamed>" : rule.name.c_str());
+					if (!rule.active)
+					{
+						ImGui::SameLine();
+						ImGui::TextDisabled("(disabled)");
+					}
+
+					ImGui::TableSetColumnIndex(5);
+					{
+						// 右对齐：用列宽算偏移（GetContentRegionAvail 在表格单元里是窗口级，
+						// 会算到列外去，所以这里必须用 GetColumnWidth）
+						const std::string key_text = rule.hotkey != 0
+							? hotkey_to_string(rule.hotkey)
+							: std::string("[No Key]");
+
+						const float text_width = ImGui::CalcTextSize(key_text.c_str()).x;
+						const float offset = ImGui::GetColumnWidth() - text_width - ImGui::GetStyle().CellPadding.x;
+						if (offset > 0.0f)
+							ImGui::SetCursorPosX(ImGui::GetCursorPosX() + offset);
+
+						if (rule.hotkey != 0)
+							ImGui::TextUnformatted(key_text.c_str());
+						else
+							ImGui::TextDisabled("%s", key_text.c_str());
+					}
+
+					ImGui::TableSetColumnIndex(6);
+					if (ImGui::Button("X"))
+						remove_index = i;
+					if (ImGui::IsItemHovered())
+						ImGui::SetTooltip("Delete this group");
+
+					ImGui::PopID();
 				}
 
-				ImGui::SameLine();
-				if (ImGui::Button("Edit"))
-					open_settings_index = i;
-
-				ImGui::SameLine();
-				if (ImGui::Button("Find"))
-				{
-					// 开启 Hunting 并重新采集：随后用 Numpad 1/2 找元素、Numpad 3 增删匹配项
-					hunting_value = true;
-					hunting_changed = true;
-					restart_requested = true;
-				}
-
-				ImGui::SameLine();
-				ImGui::Text("%s (%s%s)",
-					rule.name.empty() ? "<unnamed>" : rule.name.c_str(),
-					rule.hotkey != 0 ? hotkey_to_string(rule.hotkey).c_str() : "no key",
-					rule.active ? ", is active" : "");
-
-				ImGui::PopID();
+				ImGui::EndTable();
 			}
 
 			if (snapshot.rules.empty())
@@ -4736,85 +4813,67 @@ static void draw_overlay(effect_runtime *runtime)
 
 		ImGui::Separator();
 
-		// Rule details：原始哈希表（排查用；日常操作走上面的列表）
-		ImGui::TextDisabled("Rule details");
-		if (ImGui::BeginTable("##rules", 10,
-			ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+		// Debug: rule details —— 默认折叠；只读展示，操作统一在 Toggle Groups 里，
+		// 因此不再重复提供 Act / Set / Del，FI 与 IC 合成一列以免横向溢出。
+		if (ImGui::CollapsingHeader("Debug: rule details"))
 		{
-			ImGui::TableSetupColumn("Tex");
-			ImGui::TableSetupColumn("PS");
-			ImGui::TableSetupColumn("VS");
-			ImGui::TableSetupColumn("FI");
-			ImGui::TableSetupColumn("IC");
-			ImGui::TableSetupColumn("Key");
-			ImGui::TableSetupColumn("Mode");
-			ImGui::TableSetupColumn("Act");
-			ImGui::TableSetupColumn("Set");
-			ImGui::TableSetupColumn("Del");
-			ImGui::TableHeadersRow();
-
-			for (int i = 0; i < static_cast<int>(snapshot.rules.size()); ++i)
+			if (ImGui::BeginTable("##rules", 6,
+				ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
 			{
-				const texture_override_rule &rule = snapshot.rules[i];
-				const std::string first = value_set_to_string(rule.first_index);
-				const std::string count_text = value_set_to_string(rule.index_count);
+				ImGui::TableSetupColumn("Tex");
+				ImGui::TableSetupColumn("PS");
+				ImGui::TableSetupColumn("VS");
+				ImGui::TableSetupColumn("FI / IC");
+				ImGui::TableSetupColumn("Key");
+				ImGui::TableSetupColumn("Mode");
+				ImGui::TableHeadersRow();
 
-				ImGui::PushID(i);
-				ImGui::TableNextRow();
-
-				ImGui::TableSetColumnIndex(0);
-				if (rule.hash_any)
-					ImGui::TextUnformatted("*");
-				else
-					ImGui::Text("0x%08X", rule.hash);
-
-				ImGui::TableSetColumnIndex(1);
-				if (rule.ps_hash != 0)
-					ImGui::Text("%08X", rule.ps_hash);
-				else
-					ImGui::TextDisabled("-");
-
-				ImGui::TableSetColumnIndex(2);
-				if (rule.vs_hash != 0)
-					ImGui::Text("%08X", rule.vs_hash);
-				else
-					ImGui::TextDisabled("-");
-
-				ImGui::TableSetColumnIndex(3);
-				ImGui::TextUnformatted(first.empty() ? "*" : first.c_str());
-
-				ImGui::TableSetColumnIndex(4);
-				ImGui::TextUnformatted(count_text.empty() ? "*" : count_text.c_str());
-
-				ImGui::TableSetColumnIndex(5);
-				if (rule.hotkey != 0)
-					ImGui::TextUnformatted(hotkey_to_string(rule.hotkey).c_str());
-				else
-					ImGui::TextDisabled("-");
-
-				ImGui::TableSetColumnIndex(6);
-				ImGui::TextUnformatted(rule.handling == handling_mode::skip ? "skip" : "replace");
-
-				ImGui::TableSetColumnIndex(7);
-				bool active = rule.active;
-				if (ImGui::Checkbox("##active", &active))
+				for (int i = 0; i < static_cast<int>(snapshot.rules.size()); ++i)
 				{
-					active_index = i;
-					active_value = active;
+					const texture_override_rule &rule = snapshot.rules[i];
+					const std::string first = value_set_to_string(rule.first_index);
+					const std::string count_text = value_set_to_string(rule.index_count);
+
+					ImGui::PushID(i);
+					ImGui::TableNextRow();
+
+					ImGui::TableSetColumnIndex(0);
+					if (rule.hash_any)
+						ImGui::TextUnformatted("*");
+					else
+						ImGui::Text("0x%08X", rule.hash);
+
+					ImGui::TableSetColumnIndex(1);
+					if (rule.ps_hash != 0)
+						ImGui::Text("%08X", rule.ps_hash);
+					else
+						ImGui::TextDisabled("-");
+
+					ImGui::TableSetColumnIndex(2);
+					if (rule.vs_hash != 0)
+						ImGui::Text("%08X", rule.vs_hash);
+					else
+						ImGui::TextDisabled("-");
+
+					ImGui::TableSetColumnIndex(3);
+					ImGui::Text("%s / %s",
+						first.empty() ? "*" : first.c_str(),
+						count_text.empty() ? "*" : count_text.c_str());
+
+					ImGui::TableSetColumnIndex(4);
+					if (rule.hotkey != 0)
+						ImGui::TextUnformatted(hotkey_to_string(rule.hotkey).c_str());
+					else
+						ImGui::TextDisabled("[No Key]");
+
+					ImGui::TableSetColumnIndex(5);
+					ImGui::TextUnformatted(rule.handling == handling_mode::skip ? "skip" : "replace");
+
+					ImGui::PopID();
 				}
 
-				ImGui::TableSetColumnIndex(8);
-				if (ImGui::Button("Settings"))
-					open_settings_index = i;
-
-				ImGui::TableSetColumnIndex(9);
-				if (ImGui::Button("X"))
-					remove_index = i;
-
-				ImGui::PopID();
+				ImGui::EndTable();
 			}
-
-			ImGui::EndTable();
 		}
 
 		if (snapshot.rules.empty())
@@ -4826,12 +4885,36 @@ static void draw_overlay(effect_runtime *runtime)
 			save_requested = true;
 		ImGui::SameLine();
 		if (ImGui::Button("Reload from INI"))
-			reload_requested = true;
+		{
+			// 有未保存修改时二次确认，避免误触丢掉刚调好的规则
+			if (snapshot.has_unsaved)
+				ImGui::OpenPopup("reload_confirm");
+			else
+				reload_requested = true;
+		}
 
-		if (data->has_unsaved_changes.load(std::memory_order_relaxed))
+		if (snapshot.has_unsaved)
 		{
 			ImGui::SameLine();
 			ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.2f, 1.0f), "(Unsaved)");
+		}
+
+		if (ImGui::BeginPopupModal("reload_confirm", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+		{
+			ImGui::TextUnformatted("Reload TextureOverride.ini?");
+			ImGui::TextDisabled("Unsaved changes in the current rule list will be discarded.");
+			ImGui::Separator();
+
+			if (ImGui::Button("Reload", ImVec2(110.0f, 0.0f)))
+			{
+				reload_requested = true;
+				ImGui::CloseCurrentPopup();
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Cancel", ImVec2(110.0f, 0.0f)))
+				ImGui::CloseCurrentPopup();
+
+			ImGui::EndPopup();
 		}
 	}
 	ImGui::End();

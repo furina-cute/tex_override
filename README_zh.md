@@ -28,6 +28,7 @@ hash = 83fd403f
 match_ps_hash = 0x1a2b3c4d
 match_index_count = 420
 handling = skip
+hotkey = 0x1C300000     ; 运行时热键：Caps Lock（面板里点一下就能捕获，无需手写）
 
 ; 兼容旧写法（只有纹理哈希）
 [TextureOverrideLegacy]
@@ -62,6 +63,7 @@ handling = skip
   - `skip`：命中后 `draw_indexed` 返回 `true`，取消整次绘制。
   - `replace` / `null`：把命中槽位绑定为 1x1 全透明 SRV，绘制继续。
 - `active`：`1` / `0`，默认 `1`。
+- `hotkey`：运行时热键，打包成 `(vk << 24) | (alt << 16) | (ctrl << 8) | shift`（与 ShaderToggler 的 `ToggleKey` 同格式），`0` / 省略表示未绑定。按下时**翻转该规则的 `active`**，立即生效、立即重发规则表；不自动写盘，需要点 `Save to INI` 才持久化。**不用手写**：面板 `Settings` 里点一下 `hotkey` 输入框，按任意键即捕获（`Backspace` 清除、`Escape` 取消），支持 `Alt` / `Ctrl` / `Shift` 组合，并在撞键时给出提示。
 
 所有 `[TextureOverride*]` 段落都会被读取；同时兼容旧的 `[TextureOverride]` + `0xHASH=1` 列表（等价于无上下文的 skip 规则）。旧式列表里 `0xHASH=0` 表示**该条目被禁用**（沿用 3DMigoto 习惯），不会生成规则。
 
@@ -190,13 +192,23 @@ HUD 悬浮窗：Hunting 开启时显示在可配置位置，半透明背景，�
 
 ### 3.4 热键
 
+**固定的 Hunting 键**（不可改）：
+
 | 按键 | 条件 | 功能 |
 |---|---|---|
 | `Numpad 1` | Hunting Mode 开启 | 上一个候选（同时刷新预览） |
 | `Numpad 2` | Hunting Mode 开启 | 下一个候选（同时刷新预览） |
 | `Numpad 3` | Hunting Mode 开启 | 添加/删除当前候选的规则 |
 
-Hunting Mode 关闭时数字键完全无效。Hunting 关闭且规则为空时，`draw_indexed` 直接返回，不做任何绑定扫描。
+**每规则热键**（可选，INI 的 `hotkey` 或面板捕获）：任意键 + `Alt`/`Ctrl`/`Shift` 组合，按下即翻转该规则的 `active`。语义与实现上的几个要点：
+
+- 修饰键**严格相等**：绑 `A` 时按住 `Alt` 不会触发；绑 `Ctrl+A` 时只按 `A` 也不会触发。
+- Hunting 期间 `Numpad 1/2/3` 归 Hunting 键所有，规则热键不会抢。
+- 正在捕获新热键、或 ImGui 正在吃键盘（在输入框里打字，250 ms 抑制窗）时不触发。
+- 多条规则绑同一个键时**全部一起翻转**（面板会提示"Same shortcut is used by N other rule(s)"）。
+- 翻转只改运行时规则表，不写盘；`Save to INI` 才会把当前状态持久化。
+
+Hunting Mode 关闭时数字键完全无效。Hunting 关闭且规则为空、也没有开预览时，`draw_indexed` 直接返回，不做任何绑定扫描。
 
 ---
 
@@ -222,6 +234,7 @@ Hunting Mode 关闭时数字键完全无效。Hunting 关闭且规则为空时�
 - **跨 API 兼容**：`on_init_device` 用 `device::get_api()` 记录 `device_data::is_d3d11`。非 D3D11 时：`resolve_descriptor_hash` 直接返回 0（不做任何原生强转），`replace` 在决策点降级为 `skip` 并只警告一次；shader 哈希 / 通配符匹配不受影响。
 - **零锁热路径**：descriptor hash / pixel hash / shader hash 全部线程局部缓存 + 全局 epoch；`push_descriptors` / `draw_indexed` 中没有任何加锁。规则表发布为不可变快照（`std::atomic<const rule_table*>`），写时复制整体替换。
 - **候选预览**：hunting 时"点选/步进候选 → 立刻隐藏对应绘制"，用元素消失确认选中项（等价于 ShaderToggler/REST 的"步进即隐藏"）。实现是一个 32 位 seqlock（`candidate_preview`：hash / ps / vs / enabled + 序号），overlay 与 present 线程写、draw 线程读，读到写一半就放弃本帧预览，绝不做错匹配。匹配时先用 PS/VS 两个字段做廉价预筛（绝大多数 draw 一次比较就退出），命中同 shader 才遍历绑定 SRV，并复用慢速通道的 `bound_entry` / 线程局部哈希缓存，不额外产生 `GetDesc`。语义上等于"这条候选覆盖的所有绘制"，因此同一纹理+同一 shader 的多个 draw 会一起隐藏；预览与规则表完全解耦（没有合成规则、不写 INI），退出 Hunting 或清空候选时自动解除。它要求绑定表处于当前狩猎纪元（否则句柄可能悬垂），并且**优先于规则判定**——预览期间被隐藏的绘制不会再走规则匹配。
+- **键盘边沿与规则热键**：`poll_key_edges()` 每帧只采样一次整张 256 键表（`t_key_down` / `t_key_pressed`），Hunting 键与规则热键共用同一份快照——早期"每个键各自 `GetAsyncKeyState` 边沿"会让同一个键被两处查询时互相吞键。热键判定是"主键按下沿 + 修饰键严格相等"，修饰键同时检查 generic 与 L/R 两个 VK 码。捕获用**原始按键状态**而不是边沿快照，避免与 present 的轮询抢同一个边沿；捕获期间 `capturing_hotkey` 置位、并在关闭编辑器 / 重载 INI 时清零，防止规则热键被永久抑制。ImGui 抢键盘时用**截止时间戳**（250 ms）而不是布尔值抑制热键：叠加层关闭后 `draw_overlay` 不再被回调，布尔值会永久卡住。热键触发的翻转走 `publish_rules`（持 `publish_mutex`），并置 `has_unsaved_changes`。
 - **像素哈希**：在 `init_resource`（有 `initial_data`）与 `update_texture_region`（CPU 上传）中计算，**与当前 hash_mode 无关**，因此运行中切换模式仍能看到已加载纹理；每张纹理最多扫描 512 KiB，超出按固定步长抽行；draw 中没有任何 `CopyResource` / `Map` 回读。
 - **候选冻结**：进入 Hunting 或点 `Refresh` 后，累积 `Frames to collect` 帧的候选并集，达到目标后停止采集并冻结列表。候选键是 `(纹理哈希, PS 哈希, VS 哈希)` 三元组。
 - **候选批量插入**：`record_draw_candidates` 先在栈上收集（固定 32 项，无堆分配），一次 `lock_guard` 批量写入 `frame_candidates`，一个 draw 只抢一次锁。
@@ -296,6 +309,7 @@ set HTTPS_PROXY=
 12. **view 句柄复用（已根治，见实现要点）**：早期版本中 `stage_bindings` 的哈希以 view 句柄为键，句柄被驱动复用成同一数值时会保留旧哈希。现在由「已销毁 view 的墓碑 + 命令列表水位线」精确摘除相关绑定。残余：`t_pixel_hits`（线程局部、以 view 句柄为键）无法跨线程精确摘除，只在 **pixel 模式** 下随 view 销毁整体失效；descriptor 模式不受影响。
 13. **`replace` 不会自动恢复原绑定**：ReShade 的 `draw_indexed` 在绘制**执行前**触发，回调里无法"画完再还原"。因此被替换的槽位会一直保持 1x1 透明，直到引擎自己重新绑定。若同一帧内有多个元素共用该槽位且不重绑，后续元素也会一起变透明。
 14. **epoch 是快照，不是锁**：私有数据访问靠"先比对全局 epoch"避免地址复用 UAF。若引擎在另一个线程销毁命令列表、而本线程恰在 `present` 中汇总它的计数器，仍存在极窄窗口（`flush_command_counters` 已改为每次迭代重新校验以缩短它）。彻底消除需要引用计数，未实现。
+15. **规则热键的边界**：键码是 Windows `VK_*`，**不区分左右修饰键**（绑 `RAlt` 会按 `Alt` 记录）；`Backspace` 被保留给"清除绑定"，因此不能把规则绑到 `Backspace`；多条规则同键会同时翻转（面板有提示但不阻止）；热键只在规则表非空、且不在捕获/输入状态时生效。
 
 ---
 

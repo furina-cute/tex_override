@@ -62,6 +62,8 @@
  *   match_priority = 1           ; 可选，越大越优先
  *   handling = skip              ; skip | replace
  *   active = 1
+ *   hotkey = 0x1C300000          ; 可选，运行时热键（VK<<24 | alt<<16 | ctrl<<8 | shift）
+ *                                ; 0/省略 = 未绑定；面板里点一下输入框即可捕获
  *
  * 布尔逻辑：
  *   - 同一规则内，所有“写出来”的条件之间是 AND（全部满足才命中）；
@@ -183,6 +185,19 @@
  *     可随时用面板上的 Preview 开关关掉。实现见 candidate_preview（seqlock）。
  *   - Numpad 3 创建规则时自动写入当前捕获的 ps/vs 哈希与 first_index/index_count；
  *     “Include texture hash” 关闭时写 hash = *，得到纯稳定锚点规则。
+ *
+ * 5. 每规则热键（运行中开关单条规则）
+ * ============================================================================
+ *
+ *   - 规则的 hotkey 字段打包 (vk << 24) | (alt << 16) | (ctrl << 8) | shift，
+ *     与 ShaderToggler 的 ToggleKey 同格式；0 表示未绑定。
+ *   - 判定 = 主键按下沿 + 修饰键“严格相等”（绑 A 时按 Alt 不触发）。
+ *   - 每帧只采样一次键盘边沿（poll_key_edges），Hunting 键与规则热键共用同一份
+ *     快照；否则同一个键被两处查询时会互相吞掉边沿。
+ *   - 捕获用原始按键状态（不走快照），避免与 present 线程抢同一个边沿；
+ *     捕获期间与 ImGui 抢键盘期间（250ms 截止时间戳）都不触发。
+ *   - 触发后翻转 active 并 publish_rules（持 publish_mutex），置 unsaved 标记；
+ *     不自动写盘。
  */
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -538,6 +553,10 @@ struct texture_override_rule
 	handling_mode handling = handling_mode::skip;
 	bool active = true;
 	size_t order = 0;
+
+	// 运行时热键：打包成 (vk << 24) | (alt << 16) | (ctrl << 8) | shift。
+	// 0 = 未绑定。按下时翻转该规则的 active（不写盘，需手动 Save to INI）。
+	uint32_t hotkey = 0;
 };
 
 // 不可变规则表：UI 修改后整体替换，draw 只做一次 atomic load
@@ -893,6 +912,17 @@ struct __declspec(uuid("6b0f4d2a-3c1e-4a7b-9f2d-1e5c8a9b0d31")) device_data
 	// settings_index / settings_error（后者是 std::string）——多 swapchain 时会
 	// 变成跨线程改堆。这里只置请求，由 draw_overlay 开头落实。
 	std::atomic<bool> request_close_settings{ false };
+
+	// ---- 规则热键 ----
+	// 正在捕获新热键：期间不触发任何规则热键（否则按下的键会顺手翻转规则）
+	std::atomic<bool> capturing_hotkey{ false };
+	// ImGui 正在吃键盘（用户在输入框里打字）时的抑制截止时间（GetTickCount64，毫秒）。
+	// 用"截止时间"而不是布尔值：ReShade 在叠加层关闭时不再回调 draw_overlay，
+	// 布尔值会永久卡在 true，导致规则热键彻底失效；时间戳会自己过期。
+	std::atomic<uint64_t> keyboard_suppressed_until{ 0 };
+	// 编辑中的热键（仅 overlay 线程；点 Done 才写回规则）
+	uint32_t edit_hotkey = 0;
+	bool edit_hotkey_capturing = false;
 
 	// HUD 悬浮窗（仅 overlay 线程访问）
 	float hud_x = 24.0f;
@@ -1920,6 +1950,23 @@ static void load_config(device_data *data)
 			else
 				mark_invalid("active must be 0 or 1");
 		}
+		else if (key == "hotkey")
+		{
+			// 打包值：(vk << 24) | (alt << 16) | (ctrl << 8) | shift
+			uint32_t packed = 0;
+			if (!parse_u32(value, packed))
+			{
+				mark_invalid("hotkey must be a packed 32-bit value (use the in-game capture box)");
+			}
+			else if (packed != 0 && ((packed >> 24) & 0xFFu) == 0)
+			{
+				mark_invalid("hotkey has no key code in the high byte");
+			}
+			else
+			{
+				current.hotkey = packed;
+			}
+		}
 		// 其他键忽略（例如 3DMigoto 的 ps-t0 / vb0 / ib，本插件不处理）
 	}
 
@@ -2028,6 +2075,13 @@ static bool save_config(std::vector<texture_override_rule> rules, int hash_mode_
 
 			if (rule.priority != 0)
 				file << "match_priority = " << rule.priority << "\n";
+
+			if (rule.hotkey != 0)
+			{
+				char hotkey_text[16];
+				std::snprintf(hotkey_text, sizeof(hotkey_text), "0x%08X", rule.hotkey);
+				file << "hotkey = " << hotkey_text << "\n";
+			}
 
 			file << "handling = " << (rule.handling == handling_mode::skip ? "skip" : "replace") << "\n";
 			file << "active = " << (rule.active ? 1 : 0) << "\n\n";
@@ -3318,17 +3372,245 @@ static bool on_draw_indexed(
 // -----------------------------------------------------------------------------
 // 热键（仅 Hunting Mode 生效）
 // -----------------------------------------------------------------------------
-static bool key_pressed_edge(int vk)
-{
-	// thread_local：同一 device 挂多个 swapchain 时，ReShade 可能在不同线程
-	// 分别回调 present，这份“上一帧按键状态”不能被多线程共享。
-	static thread_local std::array<bool, 256> previous{};
-	const unsigned index = static_cast<unsigned>(vk) & 0xFFu;
+// -----------------------------------------------------------------------------
+// 键盘边沿：每帧采样一次，供"规则热键"与"Hunting 键"共用
+//
+// 早期是每个键各自调用 key_pressed_edge()：同一个键若被两处查询，第一次消费掉
+// 边沿后第二次必然返回 false（互相吞键）。现在改成一次采样整张 256 键表：
+// 规则热键、Hunting 键、以及"捕获热键"都读同一份快照。
+// 代价是每帧 256 次 GetAsyncKeyState（用户态、无系统调用），可忽略。
+// -----------------------------------------------------------------------------
+static thread_local std::array<bool, 256> t_key_down{};
+static thread_local std::array<bool, 256> t_key_pressed{};
 
-	const bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
-	const bool pressed = down && !previous[index];
-	previous[index] = down;
-	return pressed;
+static void poll_key_edges()
+{
+	for (unsigned vk = 0; vk < 256; ++vk)
+	{
+		const bool down = (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
+		t_key_pressed[vk] = down && !t_key_down[vk];
+		t_key_down[vk] = down;
+	}
+}
+
+static bool key_pressed(int vk)
+{
+	return t_key_pressed[static_cast<unsigned>(vk) & 0xFFu];
+}
+
+static bool key_down(int vk)
+{
+	return t_key_down[static_cast<unsigned>(vk) & 0xFFu];
+}
+
+static bool is_modifier_vk(int vk)
+{
+	switch (vk)
+	{
+	case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT:
+	case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL:
+	case VK_MENU: case VK_LMENU: case VK_RMENU:
+		return true;
+	default:
+		return false;
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 规则热键
+//
+// 打包格式（与 ShaderToggler 的 ToggleKey 一致，便于用户直接抄配置）：
+//     (vk << 24) | (alt << 16) | (ctrl << 8) | shift
+// 0 表示未绑定。语义：主键按下沿 + 修饰键"严格相等"——绑 A 时按住 Alt 不会触发。
+// -----------------------------------------------------------------------------
+static uint32_t make_hotkey(int vk, bool alt, bool ctrl, bool shift)
+{
+	return ((static_cast<uint32_t>(vk) & 0xFFu) << 24) |
+		(alt ? 0x010000u : 0u) |
+		(ctrl ? 0x000100u : 0u) |
+		(shift ? 0x000001u : 0u);
+}
+
+static int hotkey_vk(uint32_t packed)
+{
+	return static_cast<int>((packed >> 24) & 0xFFu);
+}
+
+static bool modifier_down(int generic_vk, int left_vk, int right_vk)
+{
+	return key_down(generic_vk) || key_down(left_vk) || key_down(right_vk);
+}
+
+static bool hotkey_pressed(uint32_t packed)
+{
+	if (packed == 0)
+		return false;
+
+	const int vk = hotkey_vk(packed);
+	if (vk == 0 || !key_pressed(vk))
+		return false;
+
+	const bool need_alt = ((packed >> 16) & 0xFFu) != 0;
+	const bool need_ctrl = ((packed >> 8) & 0xFFu) != 0;
+	const bool need_shift = (packed & 0xFFu) != 0;
+
+	const bool alt = modifier_down(VK_MENU, VK_LMENU, VK_RMENU);
+	const bool ctrl = modifier_down(VK_CONTROL, VK_LCONTROL, VK_RCONTROL);
+	const bool shift = modifier_down(VK_SHIFT, VK_LSHIFT, VK_RSHIFT);
+
+	return need_alt == alt && need_ctrl == ctrl && need_shift == shift;
+}
+
+// 键名（够用即可；未覆盖的键退回 "VK 0xNN"）
+static const char *vk_name(int vk)
+{
+	switch (vk)
+	{
+	case VK_LBUTTON: return "Left Mouse";
+	case VK_RBUTTON: return "Right Mouse";
+	case VK_MBUTTON: return "Middle Mouse";
+	case VK_BACK: return "Backspace";
+	case VK_TAB: return "Tab";
+	case VK_RETURN: return "Enter";
+	case VK_PAUSE: return "Pause";
+	case VK_CAPITAL: return "Caps Lock";
+	case VK_ESCAPE: return "Escape";
+	case VK_SPACE: return "Space";
+	case VK_PRIOR: return "Page Up";
+	case VK_NEXT: return "Page Down";
+	case VK_END: return "End";
+	case VK_HOME: return "Home";
+	case VK_LEFT: return "Left Arrow";
+	case VK_UP: return "Up Arrow";
+	case VK_RIGHT: return "Right Arrow";
+	case VK_DOWN: return "Down Arrow";
+	case VK_INSERT: return "Insert";
+	case VK_DELETE: return "Delete";
+	case VK_DECIMAL: return "Numpad Decimal";
+	case VK_DIVIDE: return "Numpad /";
+	case VK_MULTIPLY: return "Numpad *";
+	case VK_SUBTRACT: return "Numpad -";
+	case VK_ADD: return "Numpad +";
+	case VK_NUMLOCK: return "Num Lock";
+	case VK_SCROLL: return "Scroll Lock";
+	case VK_OEM_1: return "OEM ;";
+	case VK_OEM_PLUS: return "OEM +";
+	case VK_OEM_COMMA: return "OEM ,";
+	case VK_OEM_MINUS: return "OEM -";
+	case VK_OEM_PERIOD: return "OEM .";
+	case VK_OEM_2: return "OEM /";
+	case VK_OEM_3: return "OEM ~";
+	case VK_OEM_4: return "OEM [";
+	case VK_OEM_5: return "OEM \\";
+	case VK_OEM_6: return "OEM ]";
+	case VK_OEM_7: return "OEM '";
+	default: break;
+	}
+
+	if (vk >= 'A' && vk <= 'Z')
+	{
+		static thread_local char letters[32] = {};
+		letters[0] = static_cast<char>(vk);
+		letters[1] = '\0';
+		return letters;
+	}
+	if (vk >= '0' && vk <= '9')
+	{
+		static thread_local char digits[32] = {};
+		digits[0] = static_cast<char>(vk);
+		digits[1] = '\0';
+		return digits;
+	}
+	if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9)
+	{
+		static thread_local char numpad[32] = {};
+		std::snprintf(numpad, sizeof(numpad), "Numpad %d", vk - VK_NUMPAD0);
+		return numpad;
+	}
+	if (vk >= VK_F1 && vk <= VK_F24)
+	{
+		static thread_local char fkeys[32] = {};
+		std::snprintf(fkeys, sizeof(fkeys), "F%d", vk - VK_F1 + 1);
+		return fkeys;
+	}
+
+	static thread_local char fallback[32] = {};
+	std::snprintf(fallback, sizeof(fallback), "VK 0x%02X", vk);
+	return fallback;
+}
+
+static std::string hotkey_to_string(uint32_t packed)
+{
+	if (packed == 0)
+		return "None";
+
+	std::string text;
+	if (((packed >> 16) & 0xFFu) != 0) text += "Alt + ";
+	if (((packed >> 8) & 0xFFu) != 0) text += "Ctrl + ";
+	if ((packed & 0xFFu) != 0) text += "Shift + ";
+	text += vk_name(hotkey_vk(packed));
+	return text;
+}
+
+// 按下某条规则的绑定键 → 翻转它的 active 并重新发布规则表。
+// 只翻转、不写盘：是否持久化留给用户点 Save to INI。
+static void process_rule_hotkeys(device_data *data)
+{
+	// 正在捕获热键、或用户正在输入框里打字（250ms 抑制窗）时不要触发
+	if (data->capturing_hotkey.load(std::memory_order_relaxed) ||
+		GetTickCount64() < data->keyboard_suppressed_until.load(std::memory_order_relaxed))
+	{
+		return;
+	}
+
+	const rule_table *rules = acquire_rules(data);
+	if (rules == nullptr || rules->rules.empty())
+		return;
+
+	const bool hunting = data->hunting.load(std::memory_order_relaxed);
+
+	// Hunting 期间 Numpad 1/2/3 属于 Hunting 键，不允许被规则热键抢走
+	static constexpr uint32_t kHumanSpeedLimit = 8;
+	size_t toggles[kHumanSpeedLimit] = {};
+	size_t count = 0;
+
+	for (size_t i = 0; i < rules->rules.size(); ++i)
+	{
+		const uint32_t hotkey = rules->rules[i].hotkey;
+		if (hotkey == 0 || !hotkey_pressed(hotkey))
+			continue;
+
+		if (hunting)
+		{
+			const int vk = hotkey_vk(hotkey);
+			if (vk == VK_NUMPAD1 || vk == VK_NUMPAD2 || vk == VK_NUMPAD3)
+				continue;
+		}
+
+		if (count < kHumanSpeedLimit)
+			toggles[count++] = i;
+	}
+
+	if (count == 0)
+		return;
+
+	std::vector<texture_override_rule> updated = copy_rules(rules);
+
+	for (size_t i = 0; i < count; ++i)
+	{
+		texture_override_rule &rule = updated[toggles[i]];
+		rule.active = !rule.active;
+
+		char message[256];
+		std::snprintf(message, sizeof(message), "[Hotkey] '%s' -> %s (%s)",
+			rule.name.empty() ? "<unnamed>" : rule.name.c_str(),
+			rule.active ? "active" : "disabled",
+			hotkey_to_string(rule.hotkey).c_str());
+		log_info(message);
+	}
+
+	publish_rules(data, std::move(updated));
+	data->has_unsaved_changes.store(true, std::memory_order_relaxed);
 }
 
 static void toggle_rule_for_candidate(device_data *data)
@@ -3430,12 +3712,15 @@ static void toggle_rule_for_candidate(device_data *data)
 
 static void process_hotkeys(device_data *data)
 {
-	const bool prev_key = key_pressed_edge(VK_NUMPAD1);
-	const bool next_key = key_pressed_edge(VK_NUMPAD2);
-	const bool mark_key = key_pressed_edge(VK_NUMPAD3);
+	const bool prev_key = key_pressed(VK_NUMPAD1);
+	const bool next_key = key_pressed(VK_NUMPAD2);
+	const bool mark_key = key_pressed(VK_NUMPAD3);
 
-	// 只有 Hunting Mode 开启时数字键才可用
+	// 只有 Hunting Mode 开启时数字键才可用；捕获热键或在输入框打字时都不要抢键
 	if (!data->hunting.load(std::memory_order_relaxed))
+		return;
+	if (data->capturing_hotkey.load(std::memory_order_relaxed) ||
+		GetTickCount64() < data->keyboard_suppressed_until.load(std::memory_order_relaxed))
 		return;
 	if (!prev_key && !next_key && !mark_key)
 		return;
@@ -3638,7 +3923,11 @@ static void on_present(
 
 	flush_command_counters(data);
 
+	// 每帧采样一次键盘边沿，供規則热键与 Hunting 键共用
+	poll_key_edges();
+
 	process_hotkeys(data);
+	process_rule_hotkeys(data);
 
 	log_watchdog(data);
 
@@ -3739,6 +4028,9 @@ static void draw_overlay(effect_runtime *runtime)
 		data->settings_open = false;
 		data->settings_index = -1;
 		data->settings_error.clear();
+		// 关掉编辑器的同时退出热键捕获态，否则规则热键会被永久抑制
+		data->edit_hotkey_capturing = false;
+		data->capturing_hotkey.store(false, std::memory_order_relaxed);
 	}
 
 	// 1) 锁内只做快照
@@ -4038,7 +4330,7 @@ static void draw_overlay(effect_runtime *runtime)
 		ImGui::Separator();
 
 		// Rules 表格
-		if (ImGui::BeginTable("##rules", 9,
+		if (ImGui::BeginTable("##rules", 10,
 			ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
 		{
 			ImGui::TableSetupColumn("Tex");
@@ -4046,6 +4338,7 @@ static void draw_overlay(effect_runtime *runtime)
 			ImGui::TableSetupColumn("VS");
 			ImGui::TableSetupColumn("FI");
 			ImGui::TableSetupColumn("IC");
+			ImGui::TableSetupColumn("Key");
 			ImGui::TableSetupColumn("Mode");
 			ImGui::TableSetupColumn("Act");
 			ImGui::TableSetupColumn("Set");
@@ -4086,9 +4379,15 @@ static void draw_overlay(effect_runtime *runtime)
 				ImGui::TextUnformatted(count_text.empty() ? "*" : count_text.c_str());
 
 				ImGui::TableSetColumnIndex(5);
-				ImGui::TextUnformatted(rule.handling == handling_mode::skip ? "skip" : "replace");
+				if (rule.hotkey != 0)
+					ImGui::TextUnformatted(hotkey_to_string(rule.hotkey).c_str());
+				else
+					ImGui::TextDisabled("-");
 
 				ImGui::TableSetColumnIndex(6);
+				ImGui::TextUnformatted(rule.handling == handling_mode::skip ? "skip" : "replace");
+
+				ImGui::TableSetColumnIndex(7);
 				bool active = rule.active;
 				if (ImGui::Checkbox("##active", &active))
 				{
@@ -4096,11 +4395,11 @@ static void draw_overlay(effect_runtime *runtime)
 					active_value = active;
 				}
 
-				ImGui::TableSetColumnIndex(7);
+				ImGui::TableSetColumnIndex(8);
 				if (ImGui::Button("Settings"))
 					open_settings_index = i;
 
-				ImGui::TableSetColumnIndex(8);
+				ImGui::TableSetColumnIndex(9);
 				if (ImGui::Button("X"))
 					remove_index = i;
 
@@ -4141,6 +4440,10 @@ static void draw_overlay(effect_runtime *runtime)
 		data->edit_priority = rule.priority;
 		data->edit_handling = rule.handling == handling_mode::skip ? 0 : 1;
 		data->edit_active = rule.active;
+		// 热键编辑：进入时把当前绑定拷进编辑缓冲，捕获状态清零
+		data->edit_hotkey = rule.hotkey;
+		data->edit_hotkey_capturing = false;
+		data->capturing_hotkey.store(false, std::memory_order_relaxed);
 
 		const std::string first = value_set_to_string(rule.first_index);
 		const std::string count_text = value_set_to_string(rule.index_count);
@@ -4213,6 +4516,95 @@ static void draw_overlay(effect_runtime *runtime)
 
 			ImGui::Checkbox("Active", &data->edit_active);
 
+			// ---- 运行时热键（捕获式）----
+			// 点输入框进入捕获；捕获期间 present 线程不触发任何规则热键。
+			// Backspace 清除，Escape 取消。
+			{
+				char hotkey_buffer[64] = {};
+				std::snprintf(hotkey_buffer, sizeof(hotkey_buffer), "%s",
+					data->edit_hotkey_capturing
+						? "Press a key... (Backspace clears, Escape cancels)"
+						: hotkey_to_string(data->edit_hotkey).c_str());
+
+				ImGui::InputText("hotkey", hotkey_buffer, sizeof(hotkey_buffer),
+					ImGuiInputTextFlags_ReadOnly);
+
+				if (ImGui::IsItemClicked() || ImGui::IsItemActivated())
+				{
+					if (!data->edit_hotkey_capturing)
+					{
+						data->edit_hotkey_capturing = true;
+						data->capturing_hotkey.store(true, std::memory_order_relaxed);
+					}
+				}
+
+				if (data->edit_hotkey_capturing)
+				{
+					// 用原始按键状态捕获，不走边沿快照——避免与 present 的轮询互相吞键
+					if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0)
+					{
+						data->edit_hotkey_capturing = false;
+						data->capturing_hotkey.store(false, std::memory_order_relaxed);
+					}
+					else if ((GetAsyncKeyState(VK_BACK) & 0x8000) != 0)
+					{
+						data->edit_hotkey = 0;
+						data->edit_hotkey_capturing = false;
+						data->capturing_hotkey.store(false, std::memory_order_relaxed);
+					}
+					else
+					{
+						for (int vk = 8; vk < 256; ++vk)
+						{
+							if (is_modifier_vk(vk))
+								continue;
+							if ((GetAsyncKeyState(vk) & 0x8000) == 0)
+								continue;
+
+							const bool alt = (GetAsyncKeyState(VK_LMENU) & 0x8000) != 0 ||
+								(GetAsyncKeyState(VK_RMENU) & 0x8000) != 0;
+							const bool ctrl = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0 ||
+								(GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
+							const bool shift = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0 ||
+								(GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
+
+							data->edit_hotkey = make_hotkey(vk, alt, ctrl, shift);
+							data->edit_hotkey_capturing = false;
+							data->capturing_hotkey.store(false, std::memory_order_relaxed);
+							break;
+						}
+					}
+				}
+
+				// 与其它规则撞键时给出提示（两边都会触发；不阻止）
+				if (data->edit_hotkey != 0)
+				{
+					int conflicts = 0;
+					for (int i = 0; i < static_cast<int>(snapshot.rules.size()); ++i)
+					{
+						if (i == data->settings_index)
+							continue;
+						if (snapshot.rules[i].hotkey == data->edit_hotkey)
+							++conflicts;
+					}
+
+					if (conflicts != 0)
+					{
+						ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.25f, 1.0f),
+							"Same shortcut is used by %d other rule(s); pressing it toggles all of them.",
+							conflicts);
+					}
+					else
+					{
+						ImGui::TextDisabled("Toggling at runtime does not write the INI; press Save to INI to keep it.");
+					}
+				}
+				else
+				{
+					ImGui::TextDisabled("No shortcut. Click the field and press a key (Backspace clears).");
+				}
+			}
+
 			if (!data->settings_error.empty())
 				ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", data->settings_error.c_str());
 
@@ -4277,6 +4669,7 @@ static void draw_overlay(effect_runtime *runtime)
 						? handling_mode::skip
 						: handling_mode::replace;
 					apply_settings_rule.active = data->edit_active;
+					apply_settings_rule.hotkey = data->edit_hotkey;
 
 					apply_settings = true;
 					apply_settings_index = data->settings_index;
@@ -4292,7 +4685,12 @@ static void draw_overlay(effect_runtime *runtime)
 		data->settings_open = window_open && !settings_done;
 
 		if (!data->settings_open)
+		{
 			data->settings_index = -1;
+			// 窗口关闭/取消：退出捕获态，否则规则热键会被永久抑制
+			data->edit_hotkey_capturing = false;
+			data->capturing_hotkey.store(false, std::memory_order_relaxed);
+		}
 	}
 
 	// ---------------- HUD ----------------
@@ -4505,6 +4903,16 @@ static void draw_overlay(effect_runtime *runtime)
 		data->settings_open = false;
 		data->settings_index = -1;
 		data->settings_error.clear();
+		data->edit_hotkey_capturing = false;
+		data->capturing_hotkey.store(false, std::memory_order_relaxed);
+	}
+
+	// 让 present 线程知道"现在键盘被 ImGui 占着"（用户在输入框里打字）。
+	// 规则热键据此跳过——否则在 hash 输入框里敲 "A" 会翻转绑定 A 的规则。
+	// 用时间戳而不是布尔：叠加层关闭后本回调不再运行，布尔会永久为真。
+	if (ImGui::GetIO().WantCaptureKeyboard)
+	{
+		data->keyboard_suppressed_until.store(GetTickCount64() + 250, std::memory_order_relaxed);
 	}
 }
 

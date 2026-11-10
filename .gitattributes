@@ -1,0 +1,13 @@
+# Normalize line endings on checkout; the repo stores LF except where noted.
+* text=auto
+
+# Visual Studio files are expected with CRLF
+*.sln      text eol=crlf
+*.vcxproj  text eol=crlf
+*.ini      text eol=crlf
+
+# Binaries
+*.addon64  binary
+*.addon32  binary
+*.zip      binary
+*.png      binary

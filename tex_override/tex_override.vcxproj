@@ -33,8 +33,16 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup Label="UserMacros">
-    <!-- 优先使用环境变量 RESHADE_SDK，其次使用本目录下的 reshade-sdk -->
+    <!--
+      查找顺序：
+        1) 环境变量 RESHADE_SDK
+        2) 工程目录下的 reshade-sdk/
+        3) 仓库根目录下的 reshade-sdk/（工程位于 tex_override/ 子目录时的常规位置）
+      三者都没有时回退到 (2)，让 MSBuild 报出可读的缺失路径。
+    -->
     <ReShadeSdk Condition="'$(RESHADE_SDK)' != ''">$(RESHADE_SDK)</ReShadeSdk>
+    <ReShadeSdk Condition="'$(ReShadeSdk)' == '' and Exists('$(ProjectDir)reshade-sdk')">$(ProjectDir)reshade-sdk</ReShadeSdk>
+    <ReShadeSdk Condition="'$(ReShadeSdk)' == '' and Exists('$(ProjectDir)..\reshade-sdk')">$(ProjectDir)..\reshade-sdk</ReShadeSdk>
     <ReShadeSdk Condition="'$(ReShadeSdk)' == ''">$(ProjectDir)reshade-sdk</ReShadeSdk>
   </PropertyGroup>
   <PropertyGroup>
@@ -62,6 +70,16 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
+  </ItemDefinitionGroup>
+  <!--
+    Release 必须定义 NDEBUG：否则 assert() 会把 _wassert 与断言字符串拖进
+    addon（+19 KB），且一旦不变量被破坏就会在游戏里 abort()。
+    这里显式声明，不依赖工程模板。
+  -->
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;ImTextureID=ImU64;_CRT_SECURE_NO_WARNINGS;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />

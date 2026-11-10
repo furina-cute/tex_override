@@ -118,10 +118,39 @@
  *   或狩猎采集开启时的 draw。规则为空且未采集时 draw 会在最前面直接返回，
  *   不会计数，因此它不是引擎的全量 Draw Call 数。
  *
- *   线程安全：
+ *   线程安全 / 生命周期：
  *     - get_cmd_data() / get_device_data() 每次都先比对全局 epoch，再使用
  *       线程本地缓存指针，避免对象在其它线程销毁后地址复用造成 UAF；
- *     - 旧规则表保留最近 16 张，回收在 publish_rules 内部完成（不再跨线程依赖 present）。
+ *       **所有回调（含 on_destroy_pipeline / on_destroy_command_list）一律走这两个入口**，
+ *       不允许直接调用 frame->get_private_data；
+ *     - epoch 先推进、后释放私有数据（destroy_device / destroy_command_list），
+ *       杜绝“读到旧 epoch 又拿到将释放指针”的窗口；
+ *     - 旧规则表保留最近 16 张，回收在 publish_rules 内部完成（不再跨线程依赖 present）；
+ *     - 狩猎采集纪元 g_hunting_collect_epoch：挂机期间 push_descriptors 早退，
+ *       stage_bindings 可能残留已销毁的 view 句柄。每次开启 Hunting 推进 epoch，
+ *       **清空动作只在 push_descriptors 内发生**（新纪元 + 紧随其后的真实绑定），
+ *       draw 侧只比对、不清空：不一致就跳过本次采集/匹配，绝不使用未刷新的句柄。
+ *
+ *   descriptor 哈希缓存的精确失效（避免 GetDesc 风暴）：
+ *     - 引擎每帧会销毁几十个临时 CB/RTV/DSV。若每次资源销毁都推进全局 epoch，
+ *       所有线程的纹理哈希缓存每帧被清空几十次，下一次绘制全部 miss，
+ *       每帧上千次 GetDesc —— 这正是掉帧来源；
+ *     - 现在只有 **2D 纹理** 销毁才登记墓碑句柄（无锁环形缓冲，容量 1024），
+ *       各线程按序摘掉对应条目，成本正比于真正销毁的纹理数；
+ *     - 句柄复用：init_resource 时若句柄已在 live_textures 中（说明上一张同句柄
+ *       纹理的销毁事件丢失），保守地整体失效一次并告警；
+ *     - 视图（SRV/RTV）的创建/销毁完全不影响该缓存。
+ *
+ *   view 句柄复用的根治（限制 12）：
+ *     - bound_entry 的 descriptor/pixel 哈希以 view 句柄为键。D3D11 会把销毁后的
+ *       句柄值分配给新 view，若引擎用同一数值重绑同一槽位，set() 的 old == view
+ *       快路径会把旧哈希当成新 view 的哈希（张冠李戴）；
+ *     - 这里不做“每次绑定查一次戳表”（那要锁 + 哈希查找，落在每帧数万次的
+ *       push_descriptors 上），而是复用同一套无锁环登记**已销毁的 view**，
+ *       各命令列表用 views_validated_seq 水位线：push/draw 前一次 atomic load
+ *       比较，只有环推进时才把这段时间内死掉的 view 从绑定表**整条摘除**
+ *       （连 view 一起清空，绝不只清哈希——句柄可能已悬垂，再解析就是 UAF）；
+ *     - 只在有纹理规则或狩猎采集时追踪，默认配置零开销。
  *
  * ============================================================================
  * 3.1 着色器哈希为什么能跨会话稳定
@@ -169,6 +198,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -181,6 +211,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -551,6 +582,11 @@ static bool parse_hex_hash(const std::string &text, uint32_t &out)
 	if (input.empty() || input.size() > 8)
 		return false;
 
+	// strtoul 会接受 '+'/'-'：hash = -1 会被静默解析成 0xFFFFFFFF。
+	// 哈希必须是纯十六进制数字，先严格校验首字符。
+	if (!std::isxdigit(static_cast<unsigned char>(input[0])))
+		return false;
+
 	char *end_ptr = nullptr;
 	const unsigned long value = std::strtoul(input.c_str(), &end_ptr, 16);
 	if (end_ptr == input.c_str() || *end_ptr != '\0')
@@ -644,13 +680,14 @@ struct stage_bindings
 
 		if (old.handle == 0)
 		{
-			// active 列表满时重建，而不是直接丢弃绑定
+			// 不变量：old.handle == 0 ⇒ 该槽为空 ⇒ 非空槽位最多 127 个 ⇒
+			// active_count 必然 < active.size()，这里不可能写越界。
+			// 重建只作为不变量被破坏时的自愈手段，正常情况下不会执行。
 			if (active_count >= active.size())
-			{
 				rebuild_active();
-				if (active_count >= active.size())
-					return;
-			}
+
+			// 用断言表达不变量，而不是在 Release 里留一个永远不可达的分支
+			assert(active_count < active.size());
 
 			slots[slot] = { view, 0, 0 };
 			active[active_count++] = { static_cast<uint16_t>(slot), slots[slot] };
@@ -763,17 +800,36 @@ struct __declspec(uuid("d4e6f8a0-1b3c-4d5e-9f70-2a4c6e8b0d13")) cmd_list_data
 	uint32_t local_push_updates = 0;
 	uint32_t last_ps_hash = 0;
 	uint32_t last_vs_hash = 0;
+
+	// 本命令列表已经历过的狩猎采集纪元；与全局纪元不一致说明绑定数据陈旧
+	uint64_t current_hunting_epoch = 0;
+
+	// 绑定表已校验到的 view 墓碑序号：push/draw 前若发现 g_dead_views 推进了，
+	// 就把这段时间内死掉的 view 从绑定表里摘掉（见 revalidate_view_bindings）。
+	uint64_t views_validated_seq = 0;
 };
 
 struct __declspec(uuid("6b0f4d2a-3c1e-4a7b-9f2d-1e5c8a9b0d31")) device_data
 {
 	// 是否运行在 D3D11 上。非 D3D11 时禁止把 ReShade 句柄强转成原生 D3D 指针。
 	bool is_d3d11 = false;
-	bool replace_warned = false; // 非 D3D11 的 replace 警告只写一次
+	// 安全模式：唯一会**写入管线状态**的路径（replace 的 SetShaderResources）
+	// 与唯一会**读 CPU 纹理数据**的路径（pixel 哈希）全部关闭。
+	// 用途：怀疑插件把驱动喂成 TDR / 蓝屏时，用 [Settings] safe_mode = 1 做二分。
+	std::atomic<bool> safe_mode{ false };
+	// 非 D3D11 的 replace 警告只写一次。
+	// 注意：这条路径可能被多个命令列表线程同时进入，必须是原子变量。
+	std::atomic<bool> replace_warned{ false };
 
 	// 像素哈希 / 帧内候选（渲染线程写，UI 读）
 	std::mutex mutex;
 	std::unordered_map<resource, uint32_t, resource_hasher> pixel_hashes;
+
+	// 存活中的 2D 纹理句柄（受 mutex 保护）。
+	// 用途：把 descriptor 哈希缓存的失效精确限定在“纹理真的被销毁”上。
+	// 一帧内几十个临时 CB/RTV 的销毁不再触发全量清缓存，
+	// 同时还能识别句柄复用（init 时句柄已在集合里 = 上一次销毁事件丢失）。
+	std::unordered_set<uint64_t> live_textures;
 	std::unordered_map<candidate_key, candidate, candidate_key_hasher> frame_candidates;
 	std::unordered_map<candidate_key, candidate, candidate_key_hasher> collected_candidates;
 
@@ -783,6 +839,11 @@ struct __declspec(uuid("6b0f4d2a-3c1e-4a7b-9f2d-1e5c8a9b0d31")) device_data
 
 	// 不可变规则表：整体替换，draw 无锁读取
 	std::atomic<const rule_table *> rules{ nullptr };
+	// 发布互斥：publish_rules 会修改 retired_rule_tables / 回收旧表。
+	// 单窗口单 present 线程时它天然串行；但同一 device 挂多个 swapchain 时，
+	// ReShade 可能在不同线程分别回调 present/overlay，届时并发 push_back/erase
+	// 会直接破坏堆。发布是低频操作，加一把锁的代价可以忽略。
+	std::mutex publish_mutex;
 	std::vector<std::unique_ptr<rule_table>> retired_rule_tables;
 
 	std::atomic<uint64_t> shader_hashes_resolved{ 0 };
@@ -811,12 +872,18 @@ struct __declspec(uuid("6b0f4d2a-3c1e-4a7b-9f2d-1e5c8a9b0d31")) device_data
 	char edit_hash[16] = {};
 	char edit_ps[16] = {};
 	char edit_vs[16] = {};
-	char edit_first[128] = {};
-	char edit_count[128] = {};
+	char edit_first[512] = {};
+	char edit_count[512] = {};
 	int edit_priority = 0;
 	int edit_handling = 0;
 	bool edit_active = true;
 	std::string settings_error;
+
+	// 跨线程请求关闭编辑器。
+	// process_hotkeys（present 线程）不能直接改 overlay 线程的 settings_open /
+	// settings_index / settings_error（后者是 std::string）——多 swapchain 时会
+	// 变成跨线程改堆。这里只置请求，由 draw_overlay 开头落实。
+	std::atomic<bool> request_close_settings{ false };
 
 	// HUD 悬浮窗（仅 overlay 线程访问）
 	float hud_x = 24.0f;
@@ -841,7 +908,20 @@ struct __declspec(uuid("6b0f4d2a-3c1e-4a7b-9f2d-1e5c8a9b0d31")) device_data
 };
 
 // descriptor hash 的线程局部缓存（key 为 resource.handle）：绘制线程无锁命中
-// epoch 只在资源销毁（on_destroy_resource）时推进——视图的创建/销毁不影响它
+//
+// 失效策略 = 精确失效（tombstone ring），而不是全局清空：
+//
+//   引擎每帧会创建/销毁几十个临时常量缓冲、RTV、DSV。若每次销毁都推进一个
+//   全局 epoch，所有线程的纹理哈希缓存每帧被清空几十次，下一次绘制全部 miss，
+//   于是每帧上千次 GetDesc —— 这就是掉帧的来源。
+//
+//   现在只有 **2D 纹理** 销毁才登记一个“墓碑”句柄（环形缓冲，无锁），各线程
+//   在下次解析前按序把这几条缓存摘掉：工作量正比于真正销毁的纹理数，
+//   与帧率、draw 数无关。视图（SRV/RTV）的创建/销毁完全不影响本缓存。
+//
+//   g_resource_hash_epoch 保留两个兜底用途：
+//     (1) 某线程落后超过环容量（环内条目已被覆盖）→ 该线程整体清空；
+//     (2) 设备拆除，device_data 已失效、无法判断资源类型 → 保守失效。
 static std::atomic<uint64_t> g_resource_hash_epoch{ 1 };
 // 当前各线程缓存条目总数（近似值：插入 +1，清理时减去本线程清掉的条目数）
 static std::atomic<int> g_current_cache_size{ 0 };
@@ -850,6 +930,270 @@ static std::atomic<uint64_t> g_cache_misses{ 0 };
 
 static thread_local uint64_t t_resource_hash_epoch = 0;
 static thread_local std::unordered_map<uint64_t, uint32_t> t_resource_hashes;
+
+// 已销毁 2D 纹理的句柄环（多生产者 / 多消费者，纯原子操作，不持锁）
+//
+// 每个槽带一个 stamp：生产者先写 handle、再写 stamp（release），消费者只有在
+// stamp == 自己期望的序号时才认为该槽可用。这样既避免了“claim 了序号但还没写完
+// handle”被误读成 0 的问题，也能识别出“落后一整圈、槽已被覆盖”的极端情况。
+//
+// 序号从 1 起（槽的 stamp 初值为 0）：若从 0 起，第一个生产者领到的序号 0 恰好
+// 等于槽的初始 stamp，消费者会把“已领号、还没写完 handle”的 0 号槽误判为完整，
+// 直接跳过并永不回头 —— 第一枚墓碑就被永久丢掉了（漏一次失效）。
+// 因此 seq 与 t_dead_textures_seen 的起点必须同为 1，初始 stamp 0 表示“尚未写入”。
+//
+// 极端情形（生产者被抢占到超过一整圈）：老生产者最后写回，会让某个槽的 stamp
+// 落后于消费者的位置。消费者此时只会“本次不推进”（stamp < 位置），绝不会误删
+// 别的句柄；下一次有新墓碑写入时即自动恢复（或走整体清空兜底）。因此该设计
+// 的最坏结果是短暂的多算一次哈希，而不是脏匹配。
+static constexpr uint64_t kDeadTextureRingSize = 1024; // 必须是 2 的幂
+
+struct dead_texture_ring
+{
+	struct slot
+	{
+		std::atomic<uint64_t> stamp{ 0 };  // 0 = 该槽从未被写入
+		std::atomic<uint64_t> handle{ 0 };
+	};
+
+	slot slots[kDeadTextureRingSize] = {};
+	std::atomic<uint64_t> seq{ 1 }; // 下一个要分配的序号（从 1 起，单调递增）
+};
+
+static dead_texture_ring g_dead_textures;
+static thread_local uint64_t t_dead_textures_seen = 1; // 与 seq 同起点
+
+// 同一套无锁环，第二份实例专门登记**已销毁的 view 句柄**。
+//
+// 为什么需要它：bound_entry 里缓存的 descriptor/pixel 哈希是按 view 句柄记的。
+// D3D11 在 view 销毁后会把同一句柄值分配给新 view，如果引擎用这个数值重新绑定
+// 同一个槽位，set() 的 `old == view` 快路径会认为“还是同一个视图”，于是把旧
+// 哈希当成新 view 的哈希 —— 张冠李戴（跳过或替换错纹理）。
+//
+// 这里不做“每次绑定都查一次戳表”（那会给 push_descriptors 加一把锁 + 一次
+// 哈希查找，每帧数万次）。改为：销毁时登记，各命令列表用 views_validated_seq
+// 水位线，在 push/draw 之前一次性把这段时间内死掉的 view 从绑定表**摘除**。
+// 热路径成本：一次 atomic load + 比较；只有水位线推进时才做一次批量摘除。
+static dead_texture_ring g_dead_views;
+
+// 一次批量摘除最多回溯多少枚 view 墓碑；超过则整体丢弃绑定表（保守但正确）
+static constexpr uint64_t kDeadViewBatchSize = 256;
+
+// 批量摘除用的临时集合：thread_local 复用，稳态下无堆分配
+static thread_local std::unordered_set<uint64_t> t_destroyed_views;
+
+static void ring_push(dead_texture_ring &ring, uint64_t handle)
+{
+	if (handle == 0)
+		return;
+
+	const uint64_t seq = ring.seq.fetch_add(1, std::memory_order_relaxed);
+	dead_texture_ring::slot &slot = ring.slots[seq & (kDeadTextureRingSize - 1)];
+
+	slot.handle.store(handle, std::memory_order_relaxed);
+	// stamp 最后写：消费者看到 stamp == seq 才认为槽内容完整
+	slot.stamp.store(seq, std::memory_order_release);
+}
+
+// 登记一个已销毁的纹理句柄（写侧：on_destroy_resource，可能有多个线程）
+static void note_destroyed_texture(uint64_t handle)
+{
+	ring_push(g_dead_textures, handle);
+}
+
+// 登记一个已销毁的 view 句柄（写侧：on_destroy_resource_view）
+static void note_destroyed_view(uint64_t handle)
+{
+	ring_push(g_dead_views, handle);
+}
+
+// 整体清空并追上进度（兜底路径）
+static void reset_descriptor_hash_cache(uint64_t caught_up_seq)
+{
+	if (!t_resource_hashes.empty())
+	{
+		g_current_cache_size.fetch_sub(static_cast<int>(t_resource_hashes.size()), std::memory_order_relaxed);
+		t_resource_hashes.clear();
+	}
+
+	t_dead_textures_seen = caught_up_seq;
+}
+
+// 消费墓碑（读侧：resolve_descriptor_hash 内，常规开销只有一次原子读）
+static void drain_destroyed_textures()
+{
+	const uint64_t written = g_dead_textures.seq.load(std::memory_order_acquire);
+	if (written == t_dead_textures_seen)
+		return;
+
+	// 落后超过环容量：中间条目已被覆盖，只能整体清空（长时间不绘制的线程）
+	if (written - t_dead_textures_seen > kDeadTextureRingSize)
+	{
+		reset_descriptor_hash_cache(written);
+		return;
+	}
+
+	while (t_dead_textures_seen != written)
+	{
+		const uint64_t seq = t_dead_textures_seen;
+		const dead_texture_ring::slot &slot = g_dead_textures.slots[seq & (kDeadTextureRingSize - 1)];
+		const uint64_t stamp = slot.stamp.load(std::memory_order_acquire);
+
+		if (stamp != seq)
+		{
+			// stamp > seq：槽已被下一圈覆盖（本线程落后）-> 整体清空兜底
+			// stamp < seq：生产者已登记序号但还没写完 handle -> 下次再处理
+			if (stamp > seq)
+				reset_descriptor_hash_cache(written);
+			return;
+		}
+
+		const uint64_t handle = slot.handle.load(std::memory_order_acquire);
+		if (handle != 0 && t_resource_hashes.erase(handle) != 0)
+			g_current_cache_size.fetch_sub(1, std::memory_order_relaxed);
+
+		++t_dead_textures_seen;
+	}
+}
+
+// 精确判断：handle 是否在 [since_seq, 当前) 这段墓碑区间内被销毁。
+//
+// 用途是“插入后二次校验”：线程 A 在计算哈希的同时，线程 B 可能刚好销毁了
+// 同一张纹理。若那次销毁发生在 A 读取墓碑环位置之前，其墓碑已经被排空；
+// 若发生在之后，就必须在这里被精确识别——不能依赖再排空一次，因为排空
+// 可能走“落后整圈 → 整体清空”的兜底路径，从而跳过这条墓碑。
+static bool texture_destroyed_since(uint64_t handle, uint64_t since_seq)
+{
+	const uint64_t written = g_dead_textures.seq.load(std::memory_order_acquire);
+	if (written <= since_seq)
+		return false;
+
+	// 落后整圈：中间条目已被覆盖，无法确定 -> 按“已销毁”处理（调用方整体清空）
+	if (written - since_seq > kDeadTextureRingSize)
+		return true;
+
+	for (uint64_t seq = since_seq; seq != written; ++seq)
+	{
+		const dead_texture_ring::slot &slot = g_dead_textures.slots[seq & (kDeadTextureRingSize - 1)];
+		const uint64_t stamp = slot.stamp.load(std::memory_order_acquire);
+
+		// 生产者已登记序号但还没写完 handle：稍后的 drain 会处理，这里跳过
+		if (stamp < seq)
+			continue;
+		// 已被下一圈覆盖：信息丢失，保守按已销毁处理
+		if (stamp != seq)
+			return true;
+
+		if (slot.handle.load(std::memory_order_acquire) == handle)
+			return true;
+	}
+
+	return false;
+}
+
+// -----------------------------------------------------------------------------
+// 绑定表的 view 失效校验（限制 12 的根治）
+//
+// 触发点：on_push_descriptors / on_draw_indexed 里各一次，常规开销是
+// 「一次 atomic load + 与水位线比较」。只有当 g_dead_views 推进过，才做一次
+// 批量摘除：
+//
+//   1) 把 [views_validated_seq, now) 区间里被销毁的 view 句柄收进线程本地集合；
+//   2) 遍历六个 stage 的 active 列表，把 view 句柄命中的条目**整条摘掉**
+//      （连 view 一起清空，绝不只清哈希：句柄可能已经悬垂，任何再解析都是 UAF）；
+//   3) 水位线只推进到“确实处理完”的位置（生产者还没写完的槽留到下次）。
+//
+// 为什么不用 per-entry 的 stamp：那样每次 push 都要拿一次戳表（锁或探测），
+// 落在每帧数万次 × 每描述符一次的路径上。水位线把同样的精确性压缩成
+// 「每命令列表一次比较 + 每帧一次批量扫描」。
+// -----------------------------------------------------------------------------
+static void revalidate_view_bindings(cmd_list_data *cmd_data)
+{
+	const uint64_t now = g_dead_views.seq.load(std::memory_order_acquire);
+	if (cmd_data->views_validated_seq == now)
+		return;
+
+	// 首次使用：历史墓碑与本命令列表无关，只记录起点
+	if (cmd_data->views_validated_seq == 0)
+	{
+		cmd_data->views_validated_seq = now;
+		return;
+	}
+
+	const uint64_t since = cmd_data->views_validated_seq;
+	bool drop_all = false;
+
+	t_destroyed_views.clear();
+
+	if (now - since > kDeadViewBatchSize)
+	{
+		// 落后太多（长时间没 push/draw）：无法精确比对，整体丢弃绑定表。
+		// 绑定只会在下一次 push_descriptors 时重建，代价有限。
+		drop_all = true;
+	}
+	else
+	{
+		uint64_t seq = since;
+		for (; seq != now; ++seq)
+		{
+			const dead_texture_ring::slot &slot = g_dead_views.slots[seq & (kDeadTextureRingSize - 1)];
+			const uint64_t stamp = slot.stamp.load(std::memory_order_acquire);
+
+			if (stamp < seq)
+				break; // 生产者已领号但还没写完：本次先处理到这里，下次再来
+
+			if (stamp != seq)
+			{
+				// 槽已被下一圈覆盖：信息丢失，只能保守处理
+				drop_all = true;
+				seq = now;
+				break;
+			}
+
+			const uint64_t handle = slot.handle.load(std::memory_order_acquire);
+			if (handle != 0)
+				t_destroyed_views.insert(handle);
+		}
+
+		// 水位线只推进到已处理的位置
+		cmd_data->views_validated_seq = seq;
+	}
+
+	if (drop_all)
+	{
+		cmd_data->views_validated_seq = now;
+
+		for (int stage = 0; stage < stage_count; ++stage)
+			cmd_data->stages[stage] = {};
+		return;
+	}
+
+	if (t_destroyed_views.empty())
+		return;
+
+	for (int stage = 0; stage < stage_count; ++stage)
+	{
+		stage_bindings &binding = cmd_data->stages[stage];
+
+		uint16_t write = 0;
+		for (uint16_t i = 0; i < binding.active_count; ++i)
+		{
+			const uint16_t slot = binding.active[i].first;
+			const uint64_t handle = binding.active[i].second.view.handle;
+
+			if (handle != 0 && t_destroyed_views.find(handle) != t_destroyed_views.end())
+			{
+				// 整条摘除：slots[] 也清空，避免后续任何路径再解析这个句柄
+				binding.slots[slot] = {};
+				continue;
+			}
+
+			binding.active[write++] = binding.active[i];
+		}
+
+		binding.active_count = write;
+	}
+}
 
 // 像素哈希查询缓存：push_descriptors 不加锁，draw 侧只在首次遇到视图时加锁一次
 static std::atomic<uint64_t> g_pixel_insert_epoch{ 1 }; // 有新像素哈希写入时推进
@@ -876,6 +1220,9 @@ static thread_local std::vector<cmd_list_data *> t_owned_cmd_data;
 
 static cmd_list_data *get_cmd_data(command_list *cmd_list)
 {
+	if (cmd_list == nullptr)
+		return nullptr;
+
 	// epoch 检查必须放在最前面：对象可能在别的线程销毁且地址被复用，
 	// 先比对 epoch 才能安全使用任何缓存指针。
 	const uint64_t epoch = g_cmd_list_epoch.load(std::memory_order_relaxed);
@@ -956,12 +1303,18 @@ static std::atomic<bool> g_texture_rules_active{ false };
 // 否则候选列表永远是空的（纯 hash = * 配置下的常见场景）。
 static std::atomic<bool> g_hunting_collecting{ false };
 
+// 狩猎采集纪元：每次开启 Hunting 都推进。
+// 挂机期间 push_descriptors 早退，stage_bindings 里可能残留早已销毁的 view 句柄；
+// 新纪元强制各命令列表丢弃旧绑定，避免 record_draw_candidates 解引用悬垂句柄。
+static std::atomic<uint64_t> g_hunting_collect_epoch{ 1 };
+
 // push_descriptors 计数（诊断，不依赖 device_data）
 static std::atomic<uint64_t> g_push_updates{ 0 };
 
 // 像素哈希统计（诊断）
 static std::atomic<uint64_t> g_pixel_hash_bytes{ 0 };
 static std::atomic<bool> g_logged_shader_hash{ false };
+static std::atomic<bool> g_logged_untracked_resource{ false };
 
 // -----------------------------------------------------------------------------
 // 日志
@@ -973,10 +1326,13 @@ static void log_warn(const char *text) { reshade::log::message(reshade::log::lev
 // 非 D3D11 API 无法安全执行 replace：只警告一次，避免每帧刷屏
 static void note_replace_unavailable(device_data *data)
 {
-	if (data == nullptr || data->replace_warned)
+	if (data == nullptr)
 		return;
 
-	data->replace_warned = true;
+	// exchange 保证多线程下只有第一个调用者写日志
+	if (data->replace_warned.exchange(true, std::memory_order_relaxed))
+		return;
+
 	log_warn("[tex_override] replace unavailable on non-D3D11 API, falling back to skip");
 }
 
@@ -1035,6 +1391,9 @@ static std::atomic<uint64_t> g_rule_table_id{ 1 };
 
 static void publish_rules(device_data *data, std::vector<texture_override_rule> rules)
 {
+	// 整个发布过程（建表 + 回收旧表 + 发布指针）必须串行
+	std::lock_guard<std::mutex> publish_lock(data->publish_mutex);
+
 	for (size_t i = 0; i < rules.size(); ++i)
 		rules[i].order = i;
 
@@ -1049,6 +1408,25 @@ static void publish_rules(device_data *data, std::vector<texture_override_rule> 
 			char message[256];
 			std::snprintf(message, sizeof(message),
 				"[Rules] '%s': wildcard (hash = *) has no target texture; replace coerced to skip",
+				rule.name.empty() ? "<unnamed>" : rule.name.c_str());
+			log_warn(message);
+		}
+	}
+
+	// 安全模式：完全禁止写入管线状态（replace 的唯一实现方式是回调内
+	// SetShaderResources）。用于二分“是否是插件把驱动喂成 TDR/蓝屏”。
+	if (data->safe_mode.load(std::memory_order_relaxed))
+	{
+		for (texture_override_rule &rule : rules)
+		{
+			if (rule.handling != handling_mode::replace)
+				continue;
+
+			rule.handling = handling_mode::skip;
+
+			char message[256];
+			std::snprintf(message, sizeof(message),
+				"[Rules] '%s': safe_mode enabled; replace coerced to skip",
 				rule.name.empty() ? "<unnamed>" : rule.name.c_str());
 			log_warn(message);
 		}
@@ -1194,6 +1572,8 @@ static void load_config(device_data *data)
 	if (!file)
 	{
 		log_info("[Config] TextureOverride.ini not found; 0 rules");
+		// 没有配置文件时必须回到默认模式，否则“删掉 INI 再 Reload”会沿用旧模式
+		data->hash_mode_value.store(static_cast<int>(hash_mode::descriptor), std::memory_order_relaxed);
 		publish_rules(data, {});
 		data->has_unsaved_changes.store(false, std::memory_order_relaxed);
 		return;
@@ -1209,6 +1589,7 @@ static void load_config(device_data *data)
 	int warnings = 0;
 	size_t line_number = 0;
 	int parsed_hash_mode = -1;
+	int parsed_safe_mode = -1;
 
 	texture_override_rule current;
 	bool current_valid = true;
@@ -1300,6 +1681,28 @@ static void load_config(device_data *data)
 	{
 		++line_number;
 
+		// 第一行去掉 UTF-8 BOM（记事本/部分编辑器保存时会有），
+		// 否则首个 section 头无法识别，整段 key 被静默忽略。
+		if (line_number == 1 && line.size() >= 3 &&
+			static_cast<unsigned char>(line[0]) == 0xEF &&
+			static_cast<unsigned char>(line[1]) == 0xBB &&
+			static_cast<unsigned char>(line[2]) == 0xBF)
+		{
+			line.erase(0, 3);
+		}
+
+		// 行尾注释：';' 或 '#' 出现在空白之后即视为注释起点
+		// （值只可能是数字/区间/*，不会包含这两个字符）
+		for (size_t i = 1; i < line.size(); ++i)
+		{
+			if ((line[i] == ';' || line[i] == '#') &&
+				(line[i - 1] == ' ' || line[i - 1] == '\t'))
+			{
+				line.erase(i);
+				break;
+			}
+		}
+
 		const std::string trimmed = trim_copy(line);
 		if (trimmed.empty() || trimmed[0] == ';' || trimmed[0] == '#')
 			continue;
@@ -1343,14 +1746,24 @@ static void load_config(device_data *data)
 				else if (mode == "pixel")
 					parsed_hash_mode = static_cast<int>(hash_mode::pixel);
 			}
+			else if (key == "safe_mode")
+			{
+				uint32_t flag = 0;
+				if (parse_u32(value, flag))
+					parsed_safe_mode = (flag != 0);
+			}
 			continue;
 		}
 
-		// 兼容旧的 0xHASH=1 列表
+		// 兼容旧的 0xHASH=1 列表：右侧值为 0 表示该条目被禁用（3DMigoto 习惯）
 		if (section_is_legacy_list && key.size() > 2 && key[0] == '0' && (key[1] == 'x' || key[1] == 'X'))
 		{
+			uint32_t flag = 1;
+			if (!value.empty() && !parse_u32(value, flag))
+				flag = 1; // 无法解析的右侧值按“启用”处理，保持向后兼容
+
 			uint32_t hash = 0;
-			if (parse_hex_hash(key, hash) && hash != 0)
+			if (flag != 0 && parse_hex_hash(key, hash) && hash != 0)
 			{
 				texture_override_rule rule;
 				rule.name = "TextureOverride_" + std::to_string(parsed.size());
@@ -1376,15 +1789,21 @@ static void load_config(device_data *data)
 			else
 			{
 				uint32_t hash = 0;
-				if (parse_hex_hash(value, hash))
+				if (!parse_hex_hash(value, hash))
+				{
+					mark_invalid("hash must be 1-8 hex digits or *");
+				}
+				else if (hash == 0)
+				{
+					// 与 Group settings 保持一致：0 不是有效纹理哈希，
+					// 写 0 会退化成“任意纹理”的通配符规则，必须报错而不是静默接受。
+					mark_invalid("hash must be non-zero (use * to match any texture)");
+				}
+				else
 				{
 					current.hash = hash;
 					current.hash_any = false;
 					current_has_hash = true;
-				}
-				else
-				{
-					mark_invalid("hash must be 1-8 hex digits or *");
 				}
 			}
 		}
@@ -1450,6 +1869,17 @@ static void load_config(device_data *data)
 	if (parsed_hash_mode >= 0)
 		data->hash_mode_value.store(parsed_hash_mode, std::memory_order_relaxed);
 
+	// 必须先于 publish_rules 生效：安全模式会在发布时把 replace 降级为 skip
+	if (parsed_safe_mode >= 0)
+	{
+		data->safe_mode.store(parsed_safe_mode != 0, std::memory_order_relaxed);
+		if (parsed_safe_mode != 0)
+		{
+			data->hash_mode_value.store(static_cast<int>(hash_mode::descriptor), std::memory_order_relaxed);
+			log_warn("[tex_override] SAFE MODE: replace coerced to skip, pixel hashing disabled");
+		}
+	}
+
 	const size_t loaded_count = parsed.size();
 
 	publish_rules(data, std::move(parsed));
@@ -1472,7 +1902,7 @@ static void load_config(device_data *data)
 // -----------------------------------------------------------------------------
 // INI 保存
 // -----------------------------------------------------------------------------
-static bool save_config(std::vector<texture_override_rule> rules, int hash_mode_value)
+static bool save_config(std::vector<texture_override_rule> rules, int hash_mode_value, bool safe_mode)
 {
 	const std::filesystem::path path = get_config_path();
 	std::filesystem::path temp = path;
@@ -1495,7 +1925,8 @@ static bool save_config(std::vector<texture_override_rule> rules, int hash_mode_
 		file << "[Settings]\n";
 		file << "hash_mode = "
 			<< (hash_mode_value == static_cast<int>(hash_mode::pixel) ? "pixel" : "descriptor")
-			<< "\n\n";
+			<< "\n";
+		file << "safe_mode = " << (safe_mode ? 1 : 0) << "\n\n";
 
 		for (size_t i = 0; i < rules.size(); ++i)
 		{
@@ -1580,7 +2011,7 @@ static uint32_t descriptor_hash_from_texture2d(const D3D11_TEXTURE2D_DESC &desc)
 }
 
 // 缓存以 **资源** 句柄为 key：视图随时被创建/销毁，但同一纹理的描述符哈希
-// 不会变。epoch 只在 on_destroy_resource 中推进（资源销毁才会让 key 失效）。
+// 不会变。失效只发生在该纹理真的被销毁时（见 drain_destroyed_textures）。
 static uint32_t resolve_descriptor_hash(device *dev, resource_view view)
 {
 	// 非 D3D11 下不能把 ReShade 句柄强转成 ID3D11Resource*：
@@ -1592,11 +2023,14 @@ static uint32_t resolve_descriptor_hash(device *dev, resource_view view)
 	const uint64_t epoch = g_resource_hash_epoch.load(std::memory_order_relaxed);
 	if (t_resource_hash_epoch != epoch)
 	{
-		// 资源销毁推进 epoch；视图创建/销毁不再触发全量重算
-		if (!t_resource_hashes.empty())
-			g_current_cache_size.fetch_sub(static_cast<int>(t_resource_hashes.size()), std::memory_order_relaxed);
-		t_resource_hashes.clear();
+		// 全局兜底失效（设备拆除 / 句柄复用告警 / 线程落后超过墓碑环容量）
 		t_resource_hash_epoch = epoch;
+		reset_descriptor_hash_cache(g_dead_textures.seq.load(std::memory_order_acquire));
+	}
+	else
+	{
+		// 精确失效：只摘掉此期间真正销毁的那几张纹理
+		drain_destroyed_textures();
 	}
 
 	const resource res = dev != nullptr ? dev->get_resource_from_view(view) : resource{};
@@ -1618,6 +2052,27 @@ static uint32_t resolve_descriptor_hash(device *dev, resource_view view)
 
 	g_cache_misses.fetch_add(1, std::memory_order_relaxed);
 
+	// 安全网（只走未命中路径，成本可忽略）：只有我们在 init_resource 中登记过的
+	// 2D 纹理才允许解析。挡的是“view 在 revalidate 之后、这里解析之前被销毁”
+	// 的窄窗——那时 get_resource_from_view 可能返回已释放的 ID3D11Resource*，
+	// 紧接着的 GetType/GetDesc 会直接把非法指针喂进驱动。
+	{
+		std::lock_guard<std::mutex> lock(data->mutex);
+		if (data->live_textures.find(res.handle) == data->live_textures.end())
+		{
+			if (!g_logged_untracked_resource.exchange(true, std::memory_order_relaxed))
+			{
+				log_warn("[tex_override] descriptor hash skipped: resource not tracked "
+					"(created before injection?); texture-hash rules may miss it");
+			}
+			return 0;
+		}
+	}
+
+	// 在读取任何内容之前先取一次墓碑环位置：
+	// 之后插入的条目若恰好在此期间被销毁，必须能通过“二次校验”摘掉。
+	const uint64_t ring_position = g_dead_textures.seq.load(std::memory_order_acquire);
+
 	uint32_t hash = 0;
 
 	// 缓存未命中才做一次 GetDesc；资源句柄在本函数返回时仍然有效（draw 期间不会销毁）
@@ -1635,11 +2090,18 @@ static uint32_t resolve_descriptor_hash(device *dev, resource_view view)
 		}
 	}
 
-	if (hash != 0)
-	{
-		t_resource_hashes.emplace(res.handle, hash);
-		g_current_cache_size.fetch_add(1, std::memory_order_relaxed);
-	}
+	if (hash == 0)
+		return 0;
+
+	t_resource_hashes.emplace(res.handle, hash);
+	g_current_cache_size.fetch_add(1, std::memory_order_relaxed);
+
+	// 二次校验（TOCTOU 收尾）：
+	// 若在 ring_position 之后又有纹理销毁，可能正好是本句柄——销毁事件与上面的
+	// GetDesc 并发。这里直接在墓碑区间里精确查找本句柄；命中说明刚插入的缓存
+	// 已经过期，整表作废（极端罕见：同类事件每线程每次销毁最多一次）。
+	if (texture_destroyed_since(res.handle, ring_position))
+		reset_descriptor_hash_cache(g_dead_textures.seq.load(std::memory_order_acquire));
 
 	return hash;
 }
@@ -1724,19 +2186,41 @@ static void on_init_resource(
 	auto *data = get_device_data(dev);
 	if (data == nullptr)
 		return;
-	if (initial_data == nullptr || initial_data->data == nullptr)
-		return;
 
+	// 只登记 2D 纹理：descriptor 哈希缓存只对纹理生效，CB/RTV/DSV 等
+	// 每帧几十个的临时资源既不进集合、也不会在销毁时触发失效。
 	uint32_t hash = 0;
 	uint64_t bytes = 0;
-	if (!compute_pixel_hash(desc, initial_data->data, initial_data->row_pitch, initial_data->slice_pitch, hash, &bytes))
-		return;
+	const bool has_pixel_hash =
+		!data->safe_mode.load(std::memory_order_relaxed) &&
+		initial_data != nullptr && initial_data->data != nullptr &&
+		compute_pixel_hash(desc, initial_data->data, initial_data->row_pitch, initial_data->slice_pitch, hash, &bytes);
+
+	bool handle_reused = false;
+	bool hash_inserted = false;
 
 	{
 		std::lock_guard<std::mutex> lock(data->mutex);
-		if (!data->pixel_hashes.emplace(res, hash).second)
-			return;
+
+		if (desc.type == resource_type::texture_2d)
+		{
+			// 句柄已在集合里 => 上一张同句柄纹理的销毁事件丢失了
+			// （例如注入前创建的资源）。此时必须保守失效一次，避免命中脏哈希。
+			handle_reused = !data->live_textures.insert(res.handle).second;
+		}
+
+		if (has_pixel_hash)
+			hash_inserted = data->pixel_hashes.emplace(res, hash).second;
 	}
+
+	if (handle_reused)
+	{
+		g_resource_hash_epoch.fetch_add(1, std::memory_order_relaxed);
+		log_warn("[tex_override] texture handle reused without destroy event; descriptor hash cache invalidated");
+	}
+
+	if (!hash_inserted)
+		return;
 
 	// 新哈希可用，让 draw 侧的负缓存失效
 	g_pixel_insert_epoch.fetch_add(1, std::memory_order_relaxed);
@@ -1745,19 +2229,57 @@ static void on_init_resource(
 
 static void on_destroy_resource(device *dev, resource res)
 {
-	// 无条件失效：即使 device_data 尚未建立/已失效，资源销毁也必须让缓存作废，
-	// 否则句柄被复用时可能命中旧哈希。
-	// 性能取舍：每次资源销毁都会让所有线程的 descriptor 缓存整体作废（流式加载
-	// 时会有少量重算，未命中才 GetDesc），但换来的是一定不会出现句柄复用的脏哈希。
-	g_resource_hash_epoch.fetch_add(1, std::memory_order_relaxed);
+	device_data *data = get_device_data(dev);
 
-	auto *data = get_device_data(dev);
+	// 设备拆除中（device_data 已失效）：无法判断资源类型，只能保守地让
+	// 所有线程的 descriptor 缓存整体作废一次。
 	if (data == nullptr)
+	{
+		g_resource_hash_epoch.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+
+	bool was_texture = false;
+	bool pixel_removed = false;
+
+	{
+		std::lock_guard<std::mutex> lock(data->mutex);
+		was_texture = data->live_textures.erase(res.handle) != 0;
+		pixel_removed = data->pixel_hashes.erase(res) != 0;
+	}
+
+	// 只有被登记的 2D 纹理销毁才失效缓存。一帧内几十个 CB/RTV 的销毁
+	// 不再引起全量清空 + GetDesc 风暴（这是原先的掉帧来源）。
+	if (was_texture)
+		note_destroyed_texture(res.handle);
+
+	if (pixel_removed)
+		g_pixel_reset_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+// view 销毁：登记墓碑，让各命令列表在下次 push/draw 前把相关绑定摘掉。
+//
+// 无条件登记（不再看“是否正在使用绑定表”）：那个判断会引入竞态——
+//   场景 A：规则曾经存在 → 绑定表里留着规则时代的 view 句柄 → 规则被删光
+//          （g_texture_rules_active 变 false）→ 这期间销毁的 view 不入环 →
+//          重新启用规则后，这些悬垂句柄直接进入解析路径（UAF）。
+//   场景 B：规则刚发布，销毁事件恰好落在判断之前。
+// 代价只有一次 fetch_add + 一个槽写入（每帧几十次），完全可以无条件承担。
+static void on_destroy_resource_view(device *dev, resource_view view)
+{
+	if (view.handle == 0)
 		return;
 
-	std::lock_guard<std::mutex> lock(data->mutex);
-	if (data->pixel_hashes.erase(res) != 0)
+	note_destroyed_view(view.handle);
+
+	// 像素哈希的线程局部缓存以 view 句柄为键，无法跨线程精确摘除：
+	// 只在 pixel 模式（调试/狩猎精度模式）下整体失效一次，主路径不受影响。
+	device_data *data = get_device_data(dev);
+	if (data != nullptr &&
+		data->hash_mode_value.load(std::memory_order_relaxed) == static_cast<int>(hash_mode::pixel))
+	{
 		g_pixel_reset_epoch.fetch_add(1, std::memory_order_relaxed);
+	}
 }
 
 static bool on_update_texture_region(
@@ -1775,6 +2297,10 @@ static bool on_update_texture_region(
 
 	auto *data = get_device_data(dev);
 	if (data == nullptr)
+		return false;
+
+	// 安全模式：不做任何 CPU 纹理数据扫描
+	if (data->safe_mode.load(std::memory_order_relaxed))
 		return false;
 
 	// 先查表再计算：动态纹理可能每帧 UpdateSubresource，不能每帧重算
@@ -2017,7 +2543,9 @@ static void on_bind_pipeline(command_list *cmd_list, pipeline_stage stages, pipe
 
 static void on_destroy_pipeline(device *dev, pipeline pipe)
 {
-	if (auto *data = dev->get_private_data<device_data>(); data != nullptr)
+	// 必须走 epoch 保护的访问路径：device 可能已在别的线程拆除/复用地址，
+	// 直接用 dev->get_private_data 会绕过校验，构成 UAF。
+	if (device_data *data = get_device_data(dev); data != nullptr)
 	{
 		std::lock_guard<std::mutex> lock(data->shader_mutex);
 		data->shader_hashes.erase(pipe.handle);
@@ -2028,10 +2556,38 @@ static void on_destroy_pipeline(device *dev, pipeline pipe)
 }
 
 // -----------------------------------------------------------------------------
+// 狩猎采集纪元
+//
+// 挂机期间（无纹理规则、未采集）push_descriptors 一直早退，stage_bindings 可能
+// 保存着早已销毁的 view 句柄。开启 Hunting 时推进全局纪元，各命令列表在
+// **下一次 push_descriptors** 中清空整张表，并由本帧的真实绑定重新填充。
+//
+// 职责分工（关键）：
+//   sync_hunting_epoch     —— 只允许在 on_push_descriptors 内调用：清空 + 记录新纪元。
+//   hunting_epoch_matches  —— draw 侧只比对、绝不清空。不一致说明本帧的绑定还没进来，
+//                             现有句柄可能悬垂，本次直接跳过，而不是拿它去解引用。
+// -----------------------------------------------------------------------------
+static void sync_hunting_epoch(cmd_list_data *cmd_data)
+{
+	const uint64_t epoch = g_hunting_collect_epoch.load(std::memory_order_relaxed);
+	if (cmd_data->current_hunting_epoch == epoch)
+		return;
+
+	for (int stage = 0; stage < stage_count; ++stage)
+		cmd_data->stages[stage] = {};
+
+	cmd_data->current_hunting_epoch = epoch;
+}
+
+static bool hunting_epoch_matches(const cmd_list_data *cmd_data)
+{
+	return cmd_data->current_hunting_epoch == g_hunting_collect_epoch.load(std::memory_order_relaxed);
+}
+
+// -----------------------------------------------------------------------------
 // push_descriptors：只记录 SRV 句柄，绝不做哈希计算
 //
-// 最快的出口：规则集里没有带纹理哈希的规则（例如全部是 hash = *）时，
-// 这个回调直接返回，连阶段/槽位都不记录。
+// 最快的出口：没有纹理规则且不在狩猎采集时直接返回，连阶段/槽位都不记录。
 // -----------------------------------------------------------------------------
 static void on_push_descriptors(
 	command_list *cmd_list,
@@ -2040,21 +2596,33 @@ static void on_push_descriptors(
 	uint32_t /*param_index*/,
 	const descriptor_table_update &update)
 {
-	// 没有纹理规则、也不在狩猎采集 -> 完全不需要 SRV 绑定信息。
-	// 纯 hash = * 配置下，狩猎模式必须继续记录 stage_bindings，否则候选列表为空。
-	if (!g_texture_rules_active.load(std::memory_order_relaxed) &&
-		!g_hunting_collecting.load(std::memory_order_relaxed))
+	const bool hunting = g_hunting_collecting.load(std::memory_order_relaxed);
+	const bool texture_rules = g_texture_rules_active.load(std::memory_order_relaxed);
+
+	// 没有纹理规则、也不在狩猎采集 -> 完全不需要 SRV 绑定信息
+	if (!hunting && !texture_rules)
 		return;
 
+	cmd_list_data *cmd_data = get_cmd_data(cmd_list);
+	if (cmd_data == nullptr)
+		return;
+
+	// 只有真正的 SRV 更新才会刷新绑定表；CB/UAV 等更新不做处理，
+	// 因此纪元同步要放在这些早退之后——避免“清空了旧绑定、却没有任何新绑定
+	// 写入就被标记为目标已刷新”的窗口。
 	if (update.type != descriptor_type::shader_resource_view &&
 		update.type != descriptor_type::sampler_with_resource_view)
 		return;
 	if (update.count == 0 || update.descriptors == nullptr)
 		return;
 
-	cmd_list_data *cmd_data = get_cmd_data(cmd_list);
-	if (cmd_data == nullptr)
-		return;
+	// 新纪元：先清空可能残留的陈旧 view 句柄，再写入本次的真实绑定。
+	// 清空只发生在这里（binding 只能由 push 刷新），draw 侧只比对不清空。
+	sync_hunting_epoch(cmd_data);
+
+	// 关键顺序：先摘掉已销毁的 view，再执行 set()。
+	// 否则 set() 的 `old == view` 快路径会把旧哈希记成“新 view 的哈希”。
+	revalidate_view_bindings(cmd_data);
 
 	// 普通变量自增，present 时汇总（避免高频 atomic RMW）
 	++cmd_data->local_push_updates;
@@ -2101,8 +2669,12 @@ static void on_init_command_list(command_list *cmd_list)
 
 static void on_destroy_command_list(command_list *cmd_list)
 {
-	// 先从本线程的汇总列表里摘掉，避免 present 读到已释放的计数器
-	if (cmd_list_data *cmd_data = cmd_list->get_private_data<cmd_list_data>(); cmd_data != nullptr)
+	// 走 epoch 保护的访问路径（与 push/draw 一致）：命令列表可能已在别的线程
+	// 销毁且地址被复用，直接 cmd_list->get_private_data 会绕过校验。
+	cmd_list_data *cmd_data = get_cmd_data(cmd_list);
+
+	// 先从本线程的汇总列表 / 快慢路径缓存里摘掉，避免 present 读到已释放的计数器
+	if (cmd_data != nullptr)
 	{
 		for (auto it = t_owned_cmd_data.begin(); it != t_owned_cmd_data.end(); ++it)
 		{
@@ -2118,12 +2690,22 @@ static void on_destroy_command_list(command_list *cmd_list)
 			t_last_cmd_list = nullptr;
 			t_last_cmd_data = nullptr;
 		}
+
+		for (auto it = t_cmd_data.begin(); it != t_cmd_data.end(); ++it)
+		{
+			if (it->second == cmd_data)
+			{
+				t_cmd_data.erase(it);
+				break;
+			}
+		}
 	}
 
-	cmd_list->destroy_private_data<cmd_list_data>();
-
-	// 指针可能被复用：让各线程丢弃缓存的 cmd_list_data 指针
+	// 先推进 epoch，再释放私有数据：否则存在“别的线程刚读到旧 epoch、
+	// 随后拿到即将被释放的指针”的窗口。
 	g_cmd_list_epoch.fetch_add(1, std::memory_order_relaxed);
+
+	cmd_list->destroy_private_data<cmd_list_data>();
 }
 
 // -----------------------------------------------------------------------------
@@ -2188,13 +2770,16 @@ static void on_destroy_device(device *dev)
 	if (data->null_texture.handle != 0)
 		dev->destroy_resource(data->null_texture);
 
-	// 先清残留状态再销毁私有数据：确保后续任何 push_descriptors 都不会再写 stage_bindings
+	// 先清残留状态、再推进 epoch，最后才释放私有数据：
+	// 保证任何线程要么看到旧 device_data（仍存活），要么看到新 epoch 并清缓存。
 	g_texture_rules_active.store(false, std::memory_order_release);
+	g_hunting_collecting.store(false, std::memory_order_relaxed);
+	// 设备级资源全部失效：descriptor / 像素哈希缓存必须整体作废
+	g_resource_hash_epoch.fetch_add(1, std::memory_order_relaxed);
+	g_pixel_reset_epoch.fetch_add(1, std::memory_order_relaxed);
+	g_device_epoch.fetch_add(1, std::memory_order_relaxed);
 
 	dev->destroy_private_data<device_data>();
-
-	// 让各线程丢弃缓存的 device_data 指针
-	g_device_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
 // -----------------------------------------------------------------------------
@@ -2342,6 +2927,8 @@ static void record_draw_candidates(
 				{
 					hash = resolve_descriptor_hash(dev, view);
 					entry.descriptor_hash = hash;
+					// 同步写回槽位表：rebuild_active() 会用 slots[] 重建 active[]
+					binding.slots[slot].descriptor_hash = hash;
 				}
 			}
 
@@ -2423,7 +3010,17 @@ static bool on_draw_indexed(
 
 	// 狩猎采集只在调试模式下发生，正常渲染完全跳过
 	if (collecting)
-		record_draw_candidates(dev, data, cmd_data, pixel_mode, ctx, first_index, index_count);
+	{
+		// 只比对、不清空：新纪元后的首次 push 还没发生的话，stage_bindings 里
+		// 可能仍是挂机期间留下的悬垂句柄。此时跳过本次采集（不清理，清理只由
+		// push_descriptors 在新的真实绑定到来时完成），下一次 draw 自然能抓到。
+		if (hunting_epoch_matches(cmd_data))
+		{
+			// 先摘掉已销毁的 view：候选列表绝不能把悬垂句柄解析成哈希
+			revalidate_view_bindings(cmd_data);
+			record_draw_candidates(dev, data, cmd_data, pixel_mode, ctx, first_index, index_count);
+		}
+	}
 
 	if (!has_rules)
 		return false;
@@ -2470,7 +3067,10 @@ static bool on_draw_indexed(
 				return true;
 			}
 
-			null_active_slots(cmd_list, cmd_data, data);
+			// 防御：通配符 replace 在 publish 时已被降级为 skip，正常不会走到这里。
+			// 真走到时也必须要求绑定表已在本纪元刷新，否则可能是悬垂句柄。
+			if (hunting_epoch_matches(cmd_data))
+				null_active_slots(cmd_list, cmd_data, data);
 			return false;
 		}
 	}
@@ -2478,6 +3078,15 @@ static bool on_draw_indexed(
 	// 3) 慢速通道：只有存在纹理哈希规则时才遍历 SRV
 	if (!rules->has_texture_rules)
 		return false;
+
+	// 绑定表尚未在当前纪元下刷新（开启 Hunting 后还没有新的 push）：其中的
+	// view 句柄可能已经悬垂，此时绝不解析或替换，直接按未命中处理。
+	if (!hunting_epoch_matches(cmd_data))
+		return false;
+
+	// 先把已销毁的 view 从绑定表里摘掉，再解析哈希/替换：
+	// 句柄可能被复用成同一数值，旧哈希继续留存就会张冠李戴。
+	revalidate_view_bindings(cmd_data);
 
 	const texture_override_rule *best = nullptr;
 
@@ -2560,7 +3169,9 @@ static bool on_draw_indexed(
 // -----------------------------------------------------------------------------
 static bool key_pressed_edge(int vk)
 {
-	static std::array<bool, 256> previous{};
+	// thread_local：同一 device 挂多个 swapchain 时，ReShade 可能在不同线程
+	// 分别回调 present，这份“上一帧按键状态”不能被多线程共享。
+	static thread_local std::array<bool, 256> previous{};
 	const unsigned index = static_cast<unsigned>(vk) & 0xFFu;
 
 	const bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
@@ -2658,6 +3269,12 @@ static void toggle_rule_for_candidate(device_data *data)
 
 	data->has_unsaved_changes.store(true, std::memory_order_relaxed);
 	publish_rules(data, std::move(rules));
+
+	// 规则数量变了，Group settings 里记下的下标已失效，必须关掉编辑器，
+	// 否则“Done”会把编辑内容套到另一条规则上（或静默丢弃）。
+	// 本函数可能由 present 线程的热键调用，而 settings_* 属于 overlay 线程
+	// （settings_error 还是 std::string）——只发请求，由 draw_overlay 落实。
+	data->request_close_settings.store(true, std::memory_order_relaxed);
 }
 
 static void process_hotkeys(device_data *data)
@@ -2700,6 +3317,10 @@ static void restart_candidate_collection(device_data *data)
 	data->frames_collected.store(0, std::memory_order_relaxed);
 	data->collecting.store(true, std::memory_order_relaxed);
 
+	// 新纪元：先推进 epoch，再打开采集。各命令列表会在下一次 push/draw 时
+	// 丢弃挂机期间残留的陈旧 view 句柄，避免解引用已销毁的 SRV。
+	g_hunting_collect_epoch.fetch_add(1, std::memory_order_relaxed);
+
 	// 让 push_descriptors 开始记录 SRV 绑定（没有纹理规则时也需要）
 	g_hunting_collecting.store(true, std::memory_order_relaxed);
 
@@ -2713,19 +3334,32 @@ static void restart_candidate_collection(device_data *data)
 // draw_indexed 里因此不再有 fetch_add。
 static void flush_command_counters(device_data *data)
 {
-	// 先做 epoch 检查：跨线程销毁的命令列表必须在这里被整体丢弃
-	const uint64_t epoch = g_cmd_list_epoch.load(std::memory_order_relaxed);
-	if (t_cmd_list_epoch_seen != epoch)
+	auto drop_all = [](uint64_t new_epoch)
 	{
-		t_cmd_list_epoch_seen = epoch;
+		t_cmd_list_epoch_seen = new_epoch;
 		t_cmd_data.clear();
 		t_owned_cmd_data.clear();
 		t_last_cmd_list = nullptr;
 		t_last_cmd_data = nullptr;
-	}
+	};
 
-	for (cmd_list_data *cmd : t_owned_cmd_data)
+	// 先做 epoch 检查：跨线程销毁的命令列表必须在这里被整体丢弃
+	const uint64_t entry_epoch = g_cmd_list_epoch.load(std::memory_order_relaxed);
+	if (t_cmd_list_epoch_seen != entry_epoch)
+		drop_all(entry_epoch);
+
+	// 注意：epoch 是快照而不是锁。命令列表有可能在本线程遍历期间被另一个线程
+	// 销毁，因此在每次解引用前都重新校验一次，尽量缩短窗口（彻底消除需要引用计数）。
+	for (size_t i = 0; i < t_owned_cmd_data.size(); ++i)
 	{
+		const uint64_t epoch = g_cmd_list_epoch.load(std::memory_order_relaxed);
+		if (epoch != t_cmd_list_epoch_seen)
+		{
+			drop_all(epoch);
+			return;
+		}
+
+		cmd_list_data *cmd = t_owned_cmd_data[i];
 		if (cmd == nullptr)
 			continue;
 
@@ -2762,6 +3396,66 @@ static void flush_command_counters(device_data *data)
 	}
 }
 
+// -----------------------------------------------------------------------------
+// 长跑看门狗：每分钟把各结构的规模写一行日志。
+//
+// 系统重启（内核 bugcheck）不会留下插件侧的痕迹，但在蓝屏前写入的 ReShade.log
+// 能回答一个关键问题：某个结构是否在数小时内无界增长（live_textures /
+// pixel_hashes / 候选数 / 两个墓碑环的序号）。这决定问题属于“泄漏”还是“喂了
+// 驱动非法状态”。
+// -----------------------------------------------------------------------------
+static std::atomic<uint64_t> g_watchdog_last_tick{ 0 };
+static std::atomic<uint64_t> g_watchdog_start_tick{ 0 };
+
+static void log_watchdog(device_data *data)
+{
+	const uint64_t now = GetTickCount64();
+
+	if (g_watchdog_start_tick.load(std::memory_order_relaxed) == 0)
+		g_watchdog_start_tick.store(now, std::memory_order_relaxed);
+
+	uint64_t last = g_watchdog_last_tick.load(std::memory_order_relaxed);
+	if (last != 0 && now - last < 60000)
+		return;
+
+	// 多 present 线程时只让一个写日志
+	if (!g_watchdog_last_tick.compare_exchange_strong(last, now, std::memory_order_relaxed))
+		return;
+
+	size_t live_textures = 0;
+	size_t pixel_hashes = 0;
+	size_t candidates = 0;
+
+	{
+		std::lock_guard<std::mutex> lock(data->mutex);
+		live_textures = data->live_textures.size();
+		pixel_hashes = data->pixel_hashes.size();
+		candidates = data->collected_candidates.size();
+	}
+
+	const rule_table *rules = acquire_rules(data);
+	const size_t rule_count = rules != nullptr ? rules->rules.size() : 0;
+	const uint64_t uptime = (now - g_watchdog_start_tick.load(std::memory_order_relaxed)) / 1000;
+
+	char message[352];
+	std::snprintf(message, sizeof(message),
+		"[Watch] up=%llus draws=%u skipped=%u rules=%u live_tex=%u pix_hash=%u cand=%u "
+		"srv_cache=%d dead_tex=%llu dead_view=%llu safe=%d",
+		static_cast<unsigned long long>(uptime),
+		data->draws_seen.load(std::memory_order_relaxed),
+		data->draws_skipped.load(std::memory_order_relaxed),
+		static_cast<unsigned>(rule_count),
+		static_cast<unsigned>(live_textures),
+		static_cast<unsigned>(pixel_hashes),
+		static_cast<unsigned>(candidates),
+		g_current_cache_size.load(std::memory_order_relaxed),
+		static_cast<unsigned long long>(g_dead_textures.seq.load(std::memory_order_relaxed)),
+		static_cast<unsigned long long>(g_dead_views.seq.load(std::memory_order_relaxed)),
+		data->safe_mode.load(std::memory_order_relaxed) ? 1 : 0);
+
+	log_info(message);
+}
+
 static void on_present(
 	command_queue * /*queue*/,
 	swapchain *swapchain,
@@ -2771,13 +3465,15 @@ static void on_present(
 	const rect * /*dirty_rects*/)
 {
 	device *const dev = swapchain->get_device();
-	auto *data = dev->get_private_data<device_data>();
+	device_data *data = get_device_data(dev);
 	if (data == nullptr)
 		return;
 
 	flush_command_counters(data);
 
 	process_hotkeys(data);
+
+	log_watchdog(data);
 
 	const bool hunting = data->hunting.load(std::memory_order_relaxed);
 
@@ -2860,9 +3556,19 @@ static void on_present(
 static void draw_overlay(effect_runtime *runtime)
 {
 	device *const dev = runtime->get_device();
-	auto *data = dev->get_private_data<device_data>();
+	device_data *data = get_device_data(dev);
 	if (data == nullptr)
 		return;
+
+	// 0) 落实跨线程请求（present/热键线程 → overlay 线程）。
+	// settings_open / settings_index / settings_error(std::string) 只允许 overlay
+	// 线程改动，否则多 swapchain 场景下就是跨线程改堆。
+	if (data->request_close_settings.exchange(false, std::memory_order_relaxed))
+	{
+		data->settings_open = false;
+		data->settings_index = -1;
+		data->settings_error.clear();
+	}
 
 	// 1) 锁内只做快照
 	struct overlay_snapshot
@@ -2882,6 +3588,7 @@ static void draw_overlay(effect_runtime *runtime)
 		uint32_t last_ps_hash = 0;
 		uint32_t last_vs_hash = 0;
 		bool stable_only = true;
+		bool safe_mode = false;
 		uint32_t resolved = 0;
 		uint32_t applied = 0;
 		uint32_t draws = 0;
@@ -2909,6 +3616,7 @@ static void draw_overlay(effect_runtime *runtime)
 		snapshot.last_ps_hash = data->last_ps_hash.load(std::memory_order_relaxed);
 		snapshot.last_vs_hash = data->last_vs_hash.load(std::memory_order_relaxed);
 		snapshot.stable_only = data->stable_only_rules.load(std::memory_order_relaxed);
+		snapshot.safe_mode = data->safe_mode.load(std::memory_order_relaxed);
 		snapshot.resolved = data->srv_resolved.load(std::memory_order_relaxed);
 		snapshot.applied = data->rules_applied.load(std::memory_order_relaxed);
 		snapshot.draws = data->draws_seen.load(std::memory_order_relaxed);
@@ -2988,6 +3696,11 @@ static void draw_overlay(effect_runtime *runtime)
 			static_cast<unsigned long long>(snapshot.push_updates),
 			static_cast<unsigned long long>(snapshot.shader_resolved));
 		ImGui::Text("Last draw: ps=0x%08X  vs=0x%08X", snapshot.last_ps_hash, snapshot.last_vs_hash);
+		if (snapshot.safe_mode)
+		{
+			ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
+				"SAFE MODE: replace disabled, pixel hashing off ([Settings] safe_mode = 1)");
+		}
 		ImGui::TextDisabled("stable anchors: CRC32C(DXBC chunks of PS/VS, checksum excluded)");
 		ImGui::TextDisabled("descriptor hash = CRC32C(Width_Height_Format_MipLevels_ArraySize)");
 
@@ -3312,7 +4025,18 @@ static void draw_overlay(effect_runtime *runtime)
 				const std::string hash_text = trim_copy(data->edit_hash);
 				const bool hash_any = hash_text.empty() || hash_text == "*";
 
-				if (!hash_any && (!parse_hex_hash(hash_text, hash) || hash == 0))
+				// 输入框被填满说明内容在载入时已被截断：此时接受修改会把
+				// 截断后的（可能错误的）区间写回规则，必须拒绝。
+				const bool first_truncated =
+					std::strlen(data->edit_first) + 1 >= sizeof(data->edit_first);
+				const bool count_truncated =
+					std::strlen(data->edit_count) + 1 >= sizeof(data->edit_count);
+
+				if (first_truncated || count_truncated)
+				{
+					data->settings_error = "Value list is too long for the editor; shorten it in the INI file.";
+				}
+				else if (!hash_any && (!parse_hex_hash(hash_text, hash) || hash == 0))
 				{
 					data->settings_error = "hash must be 1-8 hex digits or *.";
 					data->focus_hash_next = true;
@@ -3556,7 +4280,8 @@ static void draw_overlay(effect_runtime *runtime)
 		std::vector<texture_override_rule> rules_snapshot = copy_rules(acquire_rules(data));
 
 		if (save_config(std::move(rules_snapshot),
-			data->hash_mode_value.load(std::memory_order_relaxed)))
+			data->hash_mode_value.load(std::memory_order_relaxed),
+			data->safe_mode.load(std::memory_order_relaxed)))
 			data->has_unsaved_changes.store(false, std::memory_order_relaxed);
 	}
 
@@ -3594,6 +4319,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 
 		reshade::register_event<reshade::addon_event::init_resource>(on_init_resource);
 		reshade::register_event<reshade::addon_event::destroy_resource>(on_destroy_resource);
+		reshade::register_event<reshade::addon_event::destroy_resource_view>(on_destroy_resource_view);
 		reshade::register_event<reshade::addon_event::update_texture_region>(on_update_texture_region);
 
 		reshade::register_event<reshade::addon_event::init_pipeline>(on_init_pipeline);

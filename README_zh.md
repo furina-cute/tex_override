@@ -184,8 +184,10 @@ tex_override\bin\x64\Release\tex_override.addon64
   - `Key` 列右对齐；没有绑定时显示暗灰 `[No Key]`。
   - 组名来自 INI 的 `name =`（`Save to INI` 会写回），没名字时显示 `<unnamed>`，被禁用的组会追加 `(disabled)`。
 - `Debug: rule details`（默认**折叠**）：只读的原始哈希表 `Tex / PS / VS / FI / IC / Key / Mode`（FI 与 IC 合并为一列以免横向溢出）。增删改统一走上面的 Toggle Groups，这里不再重复提供按钮。
-- 底部：`Save to INI` / `Reload from INI`；存在未保存修改时标签显示 `(Unsaved)`，**窗口标题追加 `*`**，且点 `Reload from INI` 会弹二次确认（`Reload` / `Cancel`）。
+- 底部：`Save to INI` / `Reload from INI`；存在未保存修改时**面板顶部显示黄色 `* Unsaved changes`**，且点 `Reload from INI` 会弹二次确认（`Reload` / `Cancel`）。
 - 窗口默认尺寸会随分辨率收缩（屏幕高 < 600 或宽 < 800 时按 0.8 缩放）。
+
+> **实现约束：不要在自己的 `register_overlay` 回调里再 `ImGui::Begin` 一次。** ReShade 已经用注册时给的标题开好了窗口（`if (ImGui::Begin(widget.title...)) widget.callback(this); ImGui::End();`），再 Begin 会多出一个同名窗口；如果为了在标题上加标记而把标题写成 `xxx###id`，ID 变了就会真的出现两个窗口。所以未保存标记只能画在内容里（ReShade 的窗口标题改不了）。
 
 `Group settings` 独立窗口（点击行内 `Settings` / 列表里的 `Edit` 打开）：字段区可滚动，含 `name`、`hash`（支持 `*`）、`match_ps_hash`、`match_vs_hash`、`match_first_index`、`match_index_count`、`match_priority`、`handling`、`Active`、`hotkey`（`Capture shortcut` / `Clear` / `Cancel capture`），点 `Done` 应用并关闭。
 

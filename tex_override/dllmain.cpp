@@ -4506,14 +4506,23 @@ static void draw_overlay(effect_runtime *runtime)
 		std::min(780.0f * ui_scale, std::max(360.0f, display_size.x - 32.0f)),
 		std::min(600.0f * ui_scale, std::max(260.0f, display_size.y - 48.0f)));
 
-	ImGui::SetNextWindowSize(main_window_size, ImGuiCond_FirstUseEver);
-	// 标题带未保存标记；"###" 之后是稳定的窗口 ID，避免标记变化导致窗口位置/停靠重置
-	char main_title[64];
-	std::snprintf(main_title, sizeof(main_title), "%s###texovr_main",
-		snapshot.has_unsaved ? "Texture Override *" : "Texture Override");
+	// 注意：**不要在这里再 Begin 一个窗口**。
+	// ReShade 对 register_overlay 注册的每个 addon 已经做了：
+	//     if (ImGui::Begin(widget.title.c_str(), ...)) widget.callback(this); ImGui::End();
+	// 也就是说回调执行时已经身处 "Texture Override" 窗口内部。之前这里又 Begin 了一次，
+	// 早期因为标题同名（ID 相同）被 ImGui 合并成一个窗口，看起来没事；后来为了在标题上
+	// 打 * 把标题改成 "Texture Override###texovr_main"，ID 变了，于是屏幕上出现两个
+	// "Texture Override" 窗口。现在只在 ReShade 的窗口里画内容。
+	// 尺寸用 SetWindowSize（Begin 已经发生，SetNextWindowSize 无效）。
+	ImGui::SetWindowSize(main_window_size, ImGuiCond_FirstUseEver);
 
-	if (ImGui::Begin(main_title, nullptr))
 	{
+		if (snapshot.has_unsaved)
+		{
+			// 标题由 ReShade 控制、改不了，未保存标记放在内容顶部
+			ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.2f, 1.0f), "* Unsaved changes");
+		}
+
 		ImGui::Text("Draws: %u   Skipped: %u   Rules applied: %u",
 			snapshot.draws, snapshot.skipped, snapshot.applied);
 		ImGui::Text("Cache hit: %llu / %llu (%.1f%%)   Active SRV Cache: %d",
@@ -4893,12 +4902,6 @@ static void draw_overlay(effect_runtime *runtime)
 				reload_requested = true;
 		}
 
-		if (snapshot.has_unsaved)
-		{
-			ImGui::SameLine();
-			ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.2f, 1.0f), "(Unsaved)");
-		}
-
 		if (ImGui::BeginPopupModal("reload_confirm", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
 		{
 			ImGui::TextUnformatted("Reload TextureOverride.ini?");
@@ -4917,7 +4920,6 @@ static void draw_overlay(effect_runtime *runtime)
 			ImGui::EndPopup();
 		}
 	}
-	ImGui::End();
 
 	// ---------------- 打开设置窗口 ----------------
 	if (open_settings_index >= 0 &&

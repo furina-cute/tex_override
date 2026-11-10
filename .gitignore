@@ -18,6 +18,10 @@ tests/*.exe
 tests/*.obj
 tests/*.pdb
 tests/*.ilk
+tex_override/tests/*.exe
+tex_override/tests/*.obj
+tex_override/tests/*.pdb
+tex_override/tests/*.ilk
 
 # ---------------------------------------------------------------------------
 # IDE / tooling

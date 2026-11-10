@@ -29,11 +29,28 @@ hash = 83fd403f
 match_ps_hash = 0x1a2b3c4d
 match_index_count = 420
 handling = skip
-hotkey = 0x1C300000     ; 运行时热键：Caps Lock（面板里点一下就能捕获，无需手写）
 
 ; 兼容旧写法（只有纹理哈希）
 [TextureOverrideLegacy]
 hash = a1b2c3d4
+handling = skip
+
+; ---- Toggle Group：一个热键 + 一个 Active 开关，管住组内所有规则 ----
+[ToggleGroup_0]
+name = Main Menu
+hotkey = 0x14000000     ; 运行时热键：Caps Lock（VK 0x14；面板里点一下就能捕获，无需手写）
+active = 1
+
+; 规则用 group= 加入上面这个组（写组名，不是组序号）
+[TextureOverrideNameCard2]
+group = Main Menu
+match_ps_hash = 0x1a2b3c4d
+match_index_count = 88
+handling = skip
+
+[TextureOverrideSubMenu]
+group = Main Menu
+hash = 5c7d8e9f
 handling = skip
 ```
 
@@ -63,9 +80,24 @@ handling = skip
 - `handling`：
   - `skip`：命中后 `draw_indexed` 返回 `true`，取消整次绘制。
   - `replace` / `null`：把命中槽位绑定为 1x1 全透明 SRV，绘制继续。
-- `active`：`1` / `0`，默认 `1`。
-- **`hotkey`**：运行时热键，打包成 `(vk << 24) | (alt << 16) | (ctrl << 8) | shift`（与 ShaderToggler 的 `ToggleKey` 同格式），`0` / 省略表示未绑定。按下时**翻转该规则的 `active`**，立即生效、立即重发规则表；不自动写盘，需要点 `Save to INI` 才持久化。**不用手写**：`Group settings` 里点 `Capture shortcut`，按任意键即捕获（`Esc` 取消、`Backspace` 清除），支持 `Alt`/`Ctrl`/`Shift` 组合，撞键时面板会提示。
-- **`name`**：组名（面板 `List of Toggle Groups` 与 INI 都显示）。节名仍然是 `[TextureOverride_<i>]`——加载器只认 `textureoverride` 前缀，改名会丢掉整段规则，所以名字单独存成 `name =`。
+- `active`：`1` / `0`，默认 `1`。**这是组级开关**：组里所有规则一起启停（`[ToggleGroup_*]` 里的 `active`；规则自己的 `active=` 会被组覆盖）。
+- **`hotkey`**：运行时热键，打包成 `(vk << 24) | (alt << 16) | (ctrl << 8) | shift`（与 ShaderToggler 的 `ToggleKey` 同格式），`0` / 省略表示未绑定。按下时**翻转整组的 `active`**，立即生效、立即重发规则表；不自动写盘，需要点 `Save to INI` 才持久化。**不用手写**：`Toggle group` 窗口里点 `Capture shortcut`，按任意键即捕获（`Esc` 取消、`Backspace` 清除），支持 `Alt`/`Ctrl`/`Shift` 组合，撞键时面板会提示。**热键是组级属性**，同组多条规则共用一个。
+- **`name`**：规则的显示名（`Hash management` 里显示）。节名仍然是 `[TextureOverride_<i>]`——加载器只认 `textureoverride` 前缀，改名会丢掉整段规则，所以名字单独存成 `name =`。
+- **`group`**：所属 Toggle Group 的**名字**（对应某个 `[ToggleGroup_*]` 的 `name =`）。省略 = 这条规则自成一个隐式组，组名取它的 `name =`——旧 INI（没有 `[ToggleGroup_*]`、没有 `group=`）因此行为完全不变。
+
+#### Toggle Group（`[ToggleGroup_<n>]`）
+
+| 键 | 含义 |
+|---|---|
+| `name` | 组名，也是规则 `group=` 引用的键；同名时**第一个** section 生效（其余告警忽略） |
+| `hotkey` | 组级热键，按下翻转整组 |
+| `active` | `1` / `0`，组级启停；组内规则一起生效/失效 |
+
+- 一个组可以含**任意多条**规则；面板 `List of Toggle Groups` 一行一个组，展开可看组内规则。
+- **空组**是合法的（`New group` 就能建）：显式组（`[ToggleGroup_*]` 或面板新建）即使没有规则也会保留并写盘；狩猎过程自动生成的隐式组在最后一条规则被删掉时自动消失。
+- 组名必须唯一，且会被转义（`;` `#` 换行 → `_`）后再写盘；`group=` 与 `name=` 两处用同一份转义。
+- 旧 INI 的升级路径：加载时按 `name=` 自动生成隐式组（`active` / `hotkey` 取该规则的值），保存后就会写成规范的 `[ToggleGroup_*]` + `group=`。
+
 
 所有 `[TextureOverride*]` 段落都会被读取；同时兼容旧的 `[TextureOverride]` + `0xHASH=1` 列表（等价于无上下文的 skip 规则）。旧式列表里 `0xHASH=0` 表示**该条目被禁用**（沿用 3DMigoto 习惯），不会生成规则。
 
@@ -102,7 +134,8 @@ tex_override/                          # 仓库根
     ├── tests/
     │   ├── cache_invalidation_test.cpp  # 墓碑环失效逻辑的多线程压力测试
     │   ├── view_binding_test.cpp        # view 句柄复用 / 绑定水位线测试
-    │   └── ini_parse_test.cpp           # INI 解析器单元测试（代码块从 dllmain.cpp 抽取）
+    │   ├── ini_parse_test.cpp           # INI 解析器单元测试（代码块从 dllmain.cpp 抽取）
+    │   └── group_model_test.cpp         # Toggle Group 下标维护 / 剪枝测试
     └── reshade-sdk/                   # 第三方依赖，不随仓库提交
         ├── include/                   # ReShade v6.8.0 头文件
         └── deps/imgui/                # ImGui docking 1.92.5（IMGUI_VERSION_NUM == 19250）
@@ -181,18 +214,28 @@ tex_override\bin\x64\Release\tex_override.addon64
 - 候选列表：进入 Hunting 后累积 `Frames to collect` 帧的候选并集，随后**冻结**。行内默认显示 `tex / ps / vs / fi / ic` 全部五列，可用列表上方的 `Show: tex ps vs fi ic` 逐个开关、`all` 一键全开（**默认全开**，选择会随 `Save to INI` 写进 `[Settings] candidate_columns`）；当前选中且预览开启的行用黄色 `[Hidden]` 前缀标记（与 HUD 的 `PREVIEW` 徽标对应）。
   - 任何列都关掉时行内显示 `(no columns enabled)`，仍可点选；悬停 Tooltip 永远显示完整字段。
   - **点选即预览**：点某一行（或用 Numpad 1/2 步进）会立刻把该候选对应的绘制**隐藏**，用"元素消失"确认它是哪一块画面，再按 Numpad 3 落规则。开关是候选列表上方的 `Preview selected (hide it live)`（默认开）；旁边的 `preview hidden: N draw(s)` 是预览跳过的绘制数（不计入 `Skipped`）。
-- `List of Toggle Groups`（表格布局，默认展开）：列依次是 `# | Act | Edit | Hunt | Group | Key | X`。
-  - `X` 放在**最右**，避免紧挨着 `Edit` 误触；`Hunt` 只开启 Hunting，**不会**重启采集清空候选列表。
+- `List of Toggle Groups`（表格布局，默认展开）：**一行 = 一个组**，列依次是 `# | Act | Edit | Hunt | Group | Key | X`。
+  - 一个组可含**任意多条**规则：点组名前的小三角展开，逐条列出 `tex / fi / ic / handling`，行内带 `Edit`（规则设置）与 `X`（删这条规则）。
+  - `#` 是可点选的组序号：**选中某个组后**，狩猎时按 Numpad 3 生成的新规则会加入这个组（不选中则新建一组）。选中状态用高亮表示。
+  - `Act` 是**组级开关**：勾掉后组内所有规则一起失效（`Hash management` 里对应规则会标 `(off)`）。
+  - `Edit` 打开 `Toggle group` 窗口（组名 / 热键 / Active）。
+  - `Hunt` 只开启 Hunting，**不会**重启采集清空候选列表。
   - `Key` 列右对齐；没有绑定时显示暗灰 `[No Key]`。
-  - 组名来自 INI 的 `name =`（`Save to INI` 会写回），没名字时显示 `<unnamed>`，被禁用的组会追加 `(disabled)`。
-- `Hash management`（默认展开）：所有规则的"总账"，列为 `Tex / PS / VS / FI / IC / Key / Mode / Edit / X`（FI 与 IC 合并为一列以免横向溢出）。
+  - `X` 放在**最右**，避免紧挨着 `Edit` 误触；组里还有规则时会弹确认框（`Delete` / `Cancel`），确认后**连同组内规则一起删除**。
+  - 列表**下方**的 `+ New group` 新建一个空组（`New group`、`New group (2)`…）并自动选中它——先建组、再狩猎往里攒规则。
+  - 没名字时显示 `<unnamed>`，被禁用的组会追加 `(disabled)`。
+- `Hash management`（默认展开）：所有规则的"总账"，列为 `Tex / PS / VS / FI / IC / Group / Mode / Edit / X`（FI 与 IC 合并为一列以免横向溢出）。
   - `Edit` 打开该规则的设置窗口，`X` 直接删掉该规则——**改与删都在这一张表里完成**，不必先去 Toggle Groups 找对应行。
+  - 删掉隐式组的最后一条规则时，那个组会自动消失（显式建的空组保留）。
 - 底部：`Save to INI` / `Reload from INI`；存在未保存修改时，**在这两个按钮下方**显示黄色 `* Unsaved changes`（它俩的状态说明），点 `Reload from INI` 会弹二次确认（`Reload` / `Cancel`）。
 - 窗口默认尺寸会随分辨率收缩（屏幕高 < 600 或宽 < 800 时按 0.8 缩放）。
 
 > **实现约束：不要在自己的 `register_overlay` 回调里再 `ImGui::Begin` 一次。** ReShade 已经用注册时给的标题开好了窗口（`if (ImGui::Begin(widget.title...)) widget.callback(this); ImGui::End();`），再 Begin 会多出一个同名窗口；如果为了在标题上加标记而把标题写成 `xxx###id`，ID 变了就会真的出现两个窗口。所以未保存标记只能画在内容里（ReShade 的窗口标题改不了）。
 
-`Group settings` 独立窗口（点击行内 `Settings` / 列表里的 `Edit` 打开）：字段区可滚动，含 `name`、`hash`（支持 `*`）、`match_ps_hash`、`match_vs_hash`、`match_first_index`、`match_index_count`、`match_priority`、`handling`、`Active`、`hotkey`（`Capture shortcut` / `Clear` / `Cancel capture`），点 `Done` 应用并关闭。
+两个独立窗口（都从列表里的 `Edit` 打开，字段区可滚动）：
+
+- `Rule settings`：`name`（规则显示名）、`group`（输入已有组名 = 加入该组；输入新名字 = 新建；留空 = 自成一组，旁边列出所有现有组名可直接点选）、`hash`（支持 `*`）、`match_ps_hash`、`match_vs_hash`、`match_first_index`、`match_index_count`、`match_priority`、`handling`。**Active / 热键属于组**，不在这里编辑。
+- `Toggle group`：`name`、`Active`、`hotkey`（`Capture shortcut` / `Clear` / `Cancel capture`），点 `Done` 应用并关闭；组名重复或为空会就地报错。
 
 > **通配符与 replace**：`hash` 为 `*`（或留空）时，`handling` 下拉框会被禁用并提示 `Wildcard rules only support skip`——通配符规则没有可替换的目标纹理。即使 INI 里写了 `replace`，加载时也会被强制降级为 `skip` 并在日志中告警。
 >
@@ -210,12 +253,13 @@ HUD：Hunting 开启时**用 ImGui 前景绘制列表直接画在屏幕坐标上
 | `Numpad 2` | Hunting Mode 开启 | 下一个候选（同时刷新预览） |
 | `Numpad 3` | Hunting Mode 开启 | 添加/删除当前候选的规则 |
 
-**每规则热键**（可选，INI 的 `hotkey` 或面板捕获）：任意键 + `Alt`/`Ctrl`/`Shift` 组合，按下即翻转该规则的 `active`。语义与实现上的几个要点：
+**组热键**（可选，INI 的 `[ToggleGroup_*] hotkey` 或面板捕获）：任意键 + `Alt`/`Ctrl`/`Shift` 组合，按下即翻转**该组**的 `active`（组内所有规则一起开关）。语义与实现上的几个要点：
 
 - 修饰键**严格相等**：绑 `A` 时按住 `Alt` 不会触发；绑 `Ctrl+A` 时只按 `A` 也不会触发。
-- Hunting 期间 `Numpad 1/2/3` 归 Hunting 键所有，规则热键不会抢。
+- Hunting 期间 `Numpad 1/2/3` 归 Hunting 键所有，组热键不会抢。
 - 正在捕获新热键、或 ImGui 正在吃键盘（在输入框里打字，250 ms 抑制窗）时不触发。
-- 多条规则绑同一个键时**全部一起翻转**（面板会提示"Same shortcut is used by N other rule(s)"）。
+- 多个组绑同一个键时**全部一起翻转**（面板会提示"Same shortcut is used by N other group(s)"）。
+- 同组多条规则共用一个热键，按键只翻一次（按组收集，不会因奇偶抵消）。
 - 翻转只改运行时规则表，不写盘；`Save to INI` 才会把当前状态持久化。
 
 Hunting Mode 关闭时数字键完全无效。Hunting 关闭且规则为空、也没有开预览时，`draw_indexed` 直接返回，不做任何绑定扫描。
@@ -245,7 +289,7 @@ Hunting Mode 关闭时数字键完全无效。Hunting 关闭且规则为空、�
 - **零锁热路径**：descriptor hash / pixel hash / shader hash 全部线程局部缓存 + 全局 epoch；`push_descriptors` / `draw_indexed` 中没有任何加锁。规则表发布为不可变快照（`std::atomic<const rule_table*>`），写时复制整体替换。
 - **候选预览**：hunting 时"点选/步进候选 → 立刻隐藏对应绘制"，用元素消失确认选中项（等价于 ShaderToggler/REST 的"步进即隐藏"）。实现是一个 32 位 seqlock（`candidate_preview`：hash / ps / vs / first_index / index_count / enabled + 序号），overlay 与 present 线程写、draw 线程读，读到写一半就放弃本帧预览，绝不做错匹配。**判定顺序刻意与 `toggle_rule_for_candidate` 生成规则后的命中条件同构**：① 候选的非 0 shader 锚点必须与本次 draw 相等（0 视为通配，与 `rule_matches_draw` 一致）；② `first_index` / `index_count` 严格相等；③ `stable_only` 开启且候选有稳定锚点 → Numpad 3 会生成 `hash = *` 规则，命中条件只剩 shader + 几何，预览直接命中、**不查纹理**；④ 否则规则带纹理哈希，才遍历绑定 SRV 比对（复用 `bound_entry` / 线程局部缓存，不额外 `GetDesc`）。因此"预览消失的元素"与"落规则后被隐藏的元素"是同一个集合。预览与规则表完全解耦（不合成规则、不写 INI），退出 Hunting 或清空候选时自动解除，且**优先于规则判定**。
 - **键盘边沿与规则热键**：`poll_key_edges()` 每帧只采样一次整张 256 键表（`t_key_down` / `t_key_pressed`），Hunting 键与规则热键共用同一份快照——早期"每个键各自 `GetAsyncKeyState` 边沿"会让同一个键被两处查询时互相吞键。热键判定是"主键按下沿 + 修饰键严格相等"，修饰键同时检查 generic 与 L/R 两个 VK 码。
-- **热键捕获**：捕获与热键判定都读 **`effect_runtime` 的按键状态**（`is_key_down` / 由它派生的边沿），在 `addon_event::reshade_present` 里处理——与 ShaderToggler 的 `KeyData` 同一套数据源。**不能用 `GetAsyncKeyState`**：ReShade 用 inline hook 包了它，当面板打开且 `imgui_io.WantCaptureKeyboard` 为真时（点 `Capture shortcut` 之后正好是这个状态）`HookGetAsyncKeyState` 对所有键盘键返回 0，第三方 addon 调到的也是这个被 hook 的函数——这正是"点捕获后按任何键都没反应"的根因。流程：overlay 只置 `capturing_hotkey`，present 线程命中后写 `captured_hotkey` + `hotkey_capture_seq`，overlay 下一帧取值显示；跳过鼠标 1–6 与修饰键本身，`Esc` 取消、`Backspace` 清除，成功/取消都写日志，捕获期间每 3 秒还会打印一行 `[Hotkey] waiting for a key... (runtime sees N key(s) down)` 便于排查。`Group settings` 的字段区放在可滚动子窗口里，窗口被缩小或行数变多时热键行不会掉到看不见的位置。
+- **热键捕获**：捕获与热键判定都读 **`effect_runtime` 的按键状态**（`is_key_down` / 由它派生的边沿），在 `addon_event::reshade_present` 里处理——与 ShaderToggler 的 `KeyData` 同一套数据源。**不能用 `GetAsyncKeyState`**：ReShade 用 inline hook 包了它，当面板打开且 `imgui_io.WantCaptureKeyboard` 为真时（点 `Capture shortcut` 之后正好是这个状态）`HookGetAsyncKeyState` 对所有键盘键返回 0，第三方 addon 调到的也是这个被 hook 的函数——这正是"点捕获后按任何键都没反应"的根因。流程：overlay 只置 `capturing_hotkey`，present 线程命中后写 `captured_hotkey` + `hotkey_capture_seq`，overlay 下一帧取值显示；跳过鼠标 1–6 与修饰键本身，`Esc` 取消、`Backspace` 清除，成功/取消都写日志，捕获期间每 3 秒还会打印一行 `[Hotkey] waiting for a key... (runtime sees N key(s) down)` 便于排查。`Toggle group` 的字段区放在可滚动子窗口里，窗口被缩小或行数变多时热键行不会掉到看不见的位置。
 - **HUD 常驻（为什么必须用 `reshade_overlay`）**：`register_overlay` 注册的窗口只在面板打开时被调用（ReShade 的 `runtime_gui.cpp` 里 `if (widget.title == "OSD" ? show_splash_window : !_show_overlay) continue;`），所以 HUD 不能挂在那里；`addon_event::reshade_overlay` 是无条件派发的，而且那一帧的早退判断里有 `&& !has_addon_event<addon_event::reshade_overlay>()` —— **只要注册了这个事件，即使面板被 Home 关掉，ReShade 也会继续跑 ImGui 帧并渲染 draw data**。这正是 ShaderToggler 的 `ShaderTogglerInfo` 能常驻的原因。绘制本身用 `GetForegroundDrawList()` 按屏幕坐标画（不是窗口），所以不存在停靠/被面板遮挡；拖拽用手动命中测试，有窗口在鼠标下时让给窗口。
 - **像素哈希**：在 `init_resource`（有 `initial_data`）与 `update_texture_region`（CPU 上传）中计算，**与当前 hash_mode 无关**，因此运行中切换模式仍能看到已加载纹理；每张纹理最多扫描 512 KiB，超出按固定步长抽行；draw 中没有任何 `CopyResource` / `Map` 回读。
 - **候选冻结**：进入 Hunting 或点 `Refresh` 后，累积 `Frames to collect` 帧的候选并集，达到目标后停止采集并冻结列表。候选键是 `(纹理哈希, PS 哈希, VS 哈希)` 三元组。
@@ -255,11 +299,12 @@ Hunting Mode 关闭时数字键完全无效。Hunting 关闭且规则为空、�
 - **replace**：仅纹理规则支持；通配符规则会被降级为 `skip`（见上文）。纹理规则只替换哈希匹配的槽位。
 - **INI**：手写解析器，支持 section / 整行与行尾注释 / UTF-8 BOM / 列表 / 区间 / 大小写不敏感键名；解析失败会带行号与节名写入日志；保存采用 `.tmp` + `MoveFileExW` 原子替换。
 - **并发安全（规则发布）**：`publish_rules` 全程持有 `device_data::publish_mutex`。同一 device 挂多个 swapchain 时 ReShade 可能在不同线程回调 present/overlay，没有这把锁时并发 `push_back`/`erase` `retired_rule_tables` 会直接破坏堆。
-- **编辑器一致性**：`match_first_index` / `match_index_count` 的编辑缓冲区为 512 字节；若载入时内容已被截断，点 `Done` 会被拒绝并提示（避免把截断后的错误区间写回规则）。Numpad 3 / 主面板加删规则会改变下标，因此发布后会请求关闭 Group settings，防止 `Done` 套用到另一条规则上。
+- **编辑器一致性**：`match_first_index` / `match_index_count` 的编辑缓冲区为 512 字节；若载入时内容已被截断，点 `Done` 会被拒绝并提示（避免把截断后的错误区间写回规则）。Numpad 3 / 主面板加删规则会改变下标，因此发布后会请求关闭 `Rule settings`，防止 `Done` 套用到另一条规则上；删组会同时关掉两个编辑器。
+- **组下标维护**：规则用**下标**引用组（draw 热路径不碰字符串）。`publish_rules` 会先把组级 `active` / `hotkey` 物化到每条规则上（draw 只看 `rule.active`，热键轮询只看 `rule.hotkey`），再重建 `wildcard_rules` / `index_by_texture_hash`；删规则用 `remove_rule`（隐式组变空则连带删组），删组用 `remove_group`（组内规则一起删、其余下标前移），撤销/搬走后用 `prune_implicit_groups` 重映射。这套下标运算由 `tests/group_model_test.cpp` 逐条钉住。
 - **UI 状态线程归属**：`settings_*` / `edit_*` / `hud_*` 只允许 overlay 线程读写。热键在 present 线程触发，因此 `toggle_rule_for_candidate` 不再直接改这些字段，而是置 `device_data::request_close_settings`（原子），由 `draw_overlay` 开头落实——`settings_error` 是 `std::string`，跨线程 `clear()` 会破坏堆。
 - **Release 定义 `NDEBUG`**：`stage_bindings::set` 里的 `assert` 是"`old.handle == 0` ⇒ 非空槽位 ≤ 127 ⇒ active 未满"这条不变量的文档化表达。若 Release 未定义 `NDEBUG`，`assert` 会把 `_wassert` 与断言字符串拖进 addon（实测 +19 KB），且不变量一旦被破坏会在游戏里 `abort()`。工程文件已显式加上（Debug 保持断言生效）。
 - **UI 锁**：`draw_overlay` 只在开头用锁拷贝候选/计数器快照，规则表拷贝移到锁外（独立原子指针），随后执行 ImGui 绘制；按钮只记录意图，绘制结束后再落实修改。
-- **热键**：`GetAsyncKeyState` 边沿检测（ReShade 6.8.0 无 `on_frame`）。
+- **组选中用名字记账**：任何一次 publish（删组 / 剪枝 / 改名）都可能重排组下标，所以面板用**组名**记住"当前选中的组"，每帧末尾再解析回下标，避免 Numpad 3 把新规则塞进另一个组。
 - **并发正确性自测**：`tests/cache_invalidation_test.cpp` 把墓碑环失效逻辑原样抽出来，用 6 个 worker 线程做 `resolve`/插入、同时单线程持续「销毁 + 重建」20 万次（含句柄复用、以及故意延迟排空以触发「落后整圈 → 整体清空」的兜底路径），结束后在每个 worker 自己的线程里排空并断言：**缓存里不存在属于旧世代（已销毁）句柄的条目**。构建与运行：
 
   ```bat
@@ -280,6 +325,12 @@ Hunting Mode 关闭时数字键完全无效。Hunting 关闭且规则为空、�
   ```bat
   cl /nologo /std:c++17 /O2 /EHsc /utf-8 /Fe:view_binding_test.exe view_binding_test.cpp
   view_binding_test.exe
+  ```
+- **Toggle Group 自测**：`tests/group_model_test.cpp` 的受测代码块同样从 `dllmain.cpp` 原样抽取（`struct toggle_group` … `prune_implicit_groups`）。规则用**下标**引用组，删规则/删组时下标写错是静默的灾难，因此这里逐条钉住：删隐式组最后一条规则要连带删组、删显式组最后一条规则要保留空组、删中间组后其余规则必须仍指向原来的组、剪枝后的下标重映射、组名唯一化、以及越界删除必须是 no-op（UI 快照可能比规则表旧一帧）。
+
+  ```bat
+  cl /nologo /std:c++17 /O2 /EHsc /utf-8 /Fe:group_model_test.exe group_model_test.cpp
+  group_model_test.exe
   ```
 
 ---
@@ -321,7 +372,8 @@ set HTTPS_PROXY=
 12. **view 句柄复用（已根治，见实现要点）**：早期版本中 `stage_bindings` 的哈希以 view 句柄为键，句柄被驱动复用成同一数值时会保留旧哈希。现在由「已销毁 view 的墓碑 + 命令列表水位线」精确摘除相关绑定。残余：`t_pixel_hits`（线程局部、以 view 句柄为键）无法跨线程精确摘除，只在 **pixel 模式** 下随 view 销毁整体失效；descriptor 模式不受影响。
 13. **`replace` 不会自动恢复原绑定**：ReShade 的 `draw_indexed` 在绘制**执行前**触发，回调里无法"画完再还原"。因此被替换的槽位会一直保持 1x1 透明，直到引擎自己重新绑定。若同一帧内有多个元素共用该槽位且不重绑，后续元素也会一起变透明。
 14. **epoch 是快照，不是锁**：私有数据访问靠"先比对全局 epoch"避免地址复用 UAF。若引擎在另一个线程销毁命令列表、而本线程恰在 `present` 中汇总它的计数器，仍存在极窄窗口（`flush_command_counters` 已改为每次迭代重新校验以缩短它）。彻底消除需要引用计数，未实现。
-15. **规则热键的边界**：键码是 Windows `VK_*`，**不区分左右修饰键**（绑 `RAlt` 会按 `Alt` 记录）；`Backspace` / `Esc` 被保留给"清除/取消"，不能作为绑定键；鼠标左/右/中/X1/X2 也不参与捕获（避免点按钮时被当成绑定）；多条规则同键会同时翻转（面板有提示但不阻止）；热键只在规则表非空、且不在捕获/输入状态时生效。
+15. **组热键的边界**：键码是 Windows `VK_*`，**不区分左右修饰键**（绑 `RAlt` 会按 `Alt` 记录）；`Backspace` / `Esc` 被保留给"清除/取消"，不能作为绑定键；鼠标左/右/中/X1/X2 也不参与捕获（避免点按钮时被当成绑定）；多个组同键会同时翻转（面板有提示但不阻止）；热键只在规则表非空、且不在捕获/输入状态时生效。
+16. **组名是引用键**：规则的 `group=` 按**名字**引用组，所以改组名必须同步改引用（保存时会一起写，手改 INI 时要改两处）。旧 INI 里两条规则若写了**相同的 `name=`**，加载后会被合并成同一组（共用一个 `active` / `hotkey`）——这正是 `name` 现在表示"组名"的语义。
 
 ---
 

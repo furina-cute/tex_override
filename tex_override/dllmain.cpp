@@ -542,7 +542,7 @@ enum class handling_mode
 
 struct texture_override_rule
 {
-	std::string name;
+	std::string name;                  // 规则自己的标签（面板/Hash management 显示）
 	uint32_t hash = 0;                 // 纹理哈希（hash_any 时忽略）
 	bool hash_any = false;             // hash = *
 	uint32_t ps_hash = 0;              // 稳定锚点：像素着色器字节码 CRC32C
@@ -554,10 +554,143 @@ struct texture_override_rule
 	bool active = true;
 	size_t order = 0;
 
+	// 所属 Toggle Group 在 rule_set::groups 里的下标。
+	// active / hotkey 由组接管：publish 时从组「物化」到规则上，
+	// 这样 draw 热路径（只看 rule.active）与热键轮询都不用改。
+	size_t group = 0;
+
 	// 运行时热键：打包成 (vk << 24) | (alt << 16) | (ctrl << 8) | shift。
-	// 0 = 未绑定。按下时翻转该规则的 active（不写盘，需手动 Save to INI）。
+	// 0 = 未绑定。由所属组物化而来（组级热键）。
 	uint32_t hotkey = 0;
 };
+
+// 一个 Toggle Group = 一条或多条规则 + 一个组级热键 / 启停。
+// 规则通过 group= 引用组名；旧 INI（没有 group=）在加载时自动升级成
+// 「一条规则一个隐式组」，行为与以前完全一致。
+struct toggle_group
+{
+	std::string name;
+	uint32_t hotkey = 0;
+	bool active = true;
+
+	// true = 用户显式创建的组（面板 New 或 INI 里的 [ToggleGroup_*]）。
+	// 显式组即使暂时没有规则也会保留、也会写盘；隐式组（狩猎/旧 INI 自动生成）
+	// 在最后一条规则被删掉时自动消失，避免列表里堆一堆空壳。
+	bool persistent = false;
+};
+
+struct rule_set
+{
+	std::vector<texture_override_rule> rules;
+	std::vector<toggle_group> groups;
+};
+
+// 组名 → 下标（找不到返回 -1）
+static int find_group_index(const std::vector<toggle_group> &groups, const std::string &name)
+{
+	for (size_t i = 0; i < groups.size(); ++i)
+	{
+		if (groups[i].name == name)
+			return static_cast<int>(i);
+	}
+	return -1;
+}
+
+// 生成一个不与现有组重名的名字（"Base"、"Base (2)" ...）
+static std::string make_unique_group_name(const std::vector<toggle_group> &groups, const std::string &base)
+{
+	if (find_group_index(groups, base) < 0)
+		return base;
+
+	for (int suffix = 2; suffix < 10000; ++suffix)
+	{
+		const std::string candidate = base + " (" + std::to_string(suffix) + ")";
+		if (find_group_index(groups, candidate) < 0)
+			return candidate;
+	}
+
+	return base + " (copy)";
+}
+
+// 清掉「没有任何规则引用、且不是用户显式创建」的隐式组，并重排 group 下标。
+// 删除规则/整组之后调用，保证规则表里不残留空壳。
+static void prune_implicit_groups(rule_set &set)
+{
+	std::vector<bool> used(set.groups.size(), false);
+	for (const texture_override_rule &rule : set.rules)
+	{
+		if (rule.group < used.size())
+			used[rule.group] = true;
+	}
+
+	std::vector<size_t> remap(set.groups.size(), SIZE_MAX);
+	std::vector<toggle_group> kept;
+	kept.reserve(set.groups.size());
+
+	for (size_t i = 0; i < set.groups.size(); ++i)
+	{
+		if (!used[i] && !set.groups[i].persistent)
+			continue;
+
+		remap[i] = kept.size();
+		kept.push_back(std::move(set.groups[i]));
+	}
+
+	for (texture_override_rule &rule : set.rules)
+	{
+		if (rule.group < remap.size() && remap[rule.group] != SIZE_MAX)
+			rule.group = remap[rule.group];
+		else
+			rule.group = 0;
+	}
+
+	set.groups = std::move(kept);
+}
+
+// 删掉一个组以及组内全部规则（显式/隐式都一样：用户点的是组的 X）
+static void remove_group(rule_set &set, size_t index)
+{
+	if (index >= set.groups.size())
+		return;
+
+	set.groups.erase(set.groups.begin() + index);
+
+	for (auto it = set.rules.begin(); it != set.rules.end();)
+	{
+		if (it->group == index)
+		{
+			it = set.rules.erase(it);
+		}
+		else
+		{
+			if (it->group > index)
+				--it->group;
+			++it;
+		}
+	}
+}
+
+// 删掉一条规则；如果它的隐式组因此变空，组也一起消失。
+// 显式组（用户新建 / INI 里写了 [ToggleGroup_*]）保留，方便先建组再补规则。
+static void remove_rule(rule_set &set, size_t index)
+{
+	if (index >= set.rules.size())
+		return;
+
+	const size_t group = set.rules[index].group;
+	set.rules.erase(set.rules.begin() + index);
+
+	if (group >= set.groups.size() || set.groups[group].persistent)
+		return;
+
+	for (const texture_override_rule &rule : set.rules)
+	{
+		if (rule.group == group)
+			return;
+	}
+
+	remove_group(set, group);
+}
 
 // 不可变规则表：UI 修改后整体替换，draw 只做一次 atomic load
 struct rule_table
@@ -568,6 +701,9 @@ struct rule_table
 
 	// 全量规则（面板快照用；wildcard_rules 是它的副本）
 	std::vector<texture_override_rule> rules;
+
+	// Toggle Groups（面板列表用；rules[i].group 是它的下标）
+	std::vector<toggle_group> groups;
 
 	// 需要纹理哈希才能匹配的规则：纹理哈希 -> rules 下标
 	std::unordered_multimap<uint32_t, size_t> index_by_texture_hash;
@@ -924,7 +1060,6 @@ struct __declspec(uuid("6b0f4d2a-3c1e-4a7b-9f2d-1e5c8a9b0d31")) device_data
 	char edit_name[96] = {};
 	int edit_priority = 0;
 	int edit_handling = 0;
-	bool edit_active = true;
 	std::string settings_error;
 
 	// 跨线程请求关闭编辑器。
@@ -946,10 +1081,28 @@ struct __declspec(uuid("6b0f4d2a-3c1e-4a7b-9f2d-1e5c8a9b0d31")) device_data
 	// 用"截止时间"而不是布尔值：ReShade 在叠加层关闭时不再回调 draw_overlay，
 	// 布尔值会永久卡在 true，导致规则热键彻底失效；时间戳会自己过期。
 	std::atomic<uint64_t> keyboard_suppressed_until{ 0 };
-	// 编辑中的热键（仅 overlay 线程；点 Done 才写回规则）
-	uint32_t edit_hotkey = 0;
-	bool edit_hotkey_capturing = false;
+	// 编辑中的组热键（仅 overlay 线程；点 Done 才写回组）
 	uint32_t hotkey_capture_seq_seen = 0;
+
+	// ---- Toggle Group 编辑（仅 overlay 线程）----
+	bool group_settings_open = false;
+	int group_settings_index = -1;
+	char edit_group_name[96] = {};
+	bool edit_group_active = true;
+	uint32_t edit_group_hotkey = 0;
+	bool edit_group_hotkey_capturing = false;
+	uint32_t group_hotkey_capture_seq_seen = 0;
+	std::string group_settings_error;
+
+	// 待删除的组（删除确认弹窗的上下文；弹窗跨帧，因此不能放在栈上）
+	int pending_delete_group = -1;
+
+	// 列表里选中的组：Numpad 3 生成的新规则会加入这个组（-1 = 新建组）。
+	// present 线程（热键）要读，所以是原子量。
+	std::atomic<int> selected_group{ -1 };
+
+	// Rule settings 里编辑的组名（空 = 独立成组）
+	char edit_rule_group[96] = {};
 
 	// HUD：用前景绘制列表画（不是 ImGui 窗口），因此永远不会被面板/停靠吞掉。
 	// 仅 overlay 线程访问。
@@ -1604,13 +1757,57 @@ static constexpr size_t kMaxRetiredRuleTables = 16;
 // 规则表 id 发生器（单调递增，永不回绕到已回收的表）
 static std::atomic<uint64_t> g_rule_table_id{ 1 };
 
-static void publish_rules(device_data *data, std::vector<texture_override_rule> rules)
+static void publish_rules(device_data *data, rule_set set)
 {
+	std::vector<texture_override_rule> &rules = set.rules;
+	std::vector<toggle_group> &groups = set.groups;
+
+	// 兜底：一个组都没有时，按规则名补出「一条规则一个组」，并回填下标；
+	// 保证 rules[i].group 永远有效（正常路径下 groups 总是与 rules 一起发布）。
+	if (groups.empty() && !rules.empty())
+	{
+		for (texture_override_rule &rule : rules)
+		{
+			const std::string name = rule.name.empty() ? "Group" : rule.name;
+
+			int index = find_group_index(groups, name);
+			if (index < 0)
+			{
+				toggle_group group;
+				group.name = name;
+				group.hotkey = rule.hotkey;
+				group.active = rule.active;
+				groups.push_back(std::move(group));
+				index = static_cast<int>(groups.size()) - 1;
+			}
+
+			rule.group = static_cast<size_t>(index);
+		}
+	}
+
+	for (texture_override_rule &rule : rules)
+	{
+		if (rule.group >= groups.size())
+			rule.group = 0;
+	}
+
 	// 整个发布过程（建表 + 回收旧表 + 发布指针）必须串行
 	std::lock_guard<std::mutex> publish_lock(data->publish_mutex);
 
 	for (size_t i = 0; i < rules.size(); ++i)
 		rules[i].order = i;
+
+	// 组级 active / hotkey「物化」到规则上：draw 热路径只看 rule.active，
+	// 热键轮询只看 rule.hotkey，两者都不需要再碰组表。
+	if (!groups.empty())
+	{
+		for (texture_override_rule &rule : rules)
+		{
+			const toggle_group &group = groups[rule.group];
+			rule.active = group.active;
+			rule.hotkey = group.hotkey;
+		}
+	}
 
 	// 通配符规则无法确定要替换哪一张纹理：replace 会误伤整次绘制，
 	// 这里直接降级为 skip，并记录一次警告。
@@ -1650,6 +1847,7 @@ static void publish_rules(device_data *data, std::vector<texture_override_rule> 
 	auto table = std::make_unique<rule_table>();
 	table->id = g_rule_table_id.fetch_add(1, std::memory_order_relaxed);
 	table->rules = std::move(rules);
+	table->groups = std::move(groups);
 	table->wildcard_rules.reserve(table->rules.size());
 
 	for (size_t i = 0; i < table->rules.size(); ++i)
@@ -1696,9 +1894,15 @@ static const rule_table *acquire_rules(const device_data *data)
 	return data->rules.load(std::memory_order_acquire);
 }
 
-static std::vector<texture_override_rule> copy_rules(const rule_table *table)
+static rule_set copy_rule_set(const rule_table *table)
 {
-	return table != nullptr ? table->rules : std::vector<texture_override_rule>{};
+	rule_set set;
+	if (table != nullptr)
+	{
+		set.rules = table->rules;
+		set.groups = table->groups;
+	}
+	return set;
 }
 
 // 单条规则的稳定锚点 + 几何条件校验（AND）
@@ -1779,6 +1983,31 @@ static void refresh_wildcard_prefilter(const rule_table *rules, cmd_list_data *c
 // -----------------------------------------------------------------------------
 // INI 加载
 // -----------------------------------------------------------------------------
+// 热键的 INI 表示：打包值 (vk << 24) | (alt << 16) | (ctrl << 8) | shift。
+// 0 = 未绑定；高字节没有键码的打包值一律视为无效（否则会绑定到一个"没键"的值）。
+static bool parse_hotkey_value(const std::string &text, uint32_t &out)
+{
+	uint32_t packed = 0;
+	if (!parse_u32(text, packed))
+		return false;
+
+	if (packed != 0 && ((packed >> 24) & 0xFFu) == 0)
+		return false;
+
+	out = packed;
+	return true;
+}
+
+// 写进 INI 的文本片段：';' '#' 与换行会破坏手写语法，统一替换成 '_'
+static std::string sanitize_ini_text(const std::string &text)
+{
+	std::string safe;
+	safe.reserve(text.size());
+	for (char ch : text)
+		safe += (ch == ';' || ch == '#' || ch == '\r' || ch == '\n') ? '_' : ch;
+	return safe;
+}
+
 static void load_config(device_data *data)
 {
 	const std::filesystem::path path = get_config_path();
@@ -1790,16 +2019,19 @@ static void load_config(device_data *data)
 		// 没有配置文件时必须回到默认模式，否则“删掉 INI 再 Reload”会沿用旧模式
 		data->hash_mode_value.store(static_cast<int>(hash_mode::descriptor), std::memory_order_relaxed);
 		data->candidate_columns.store(candidate_col_all, std::memory_order_relaxed);
-		publish_rules(data, {});
+		publish_rules(data, rule_set{});
 		data->has_unsaved_changes.store(false, std::memory_order_relaxed);
 		return;
 	}
 
 	std::vector<texture_override_rule> parsed;
+	std::vector<std::string> parsed_group_names; // 与 parsed 平行：规则里写的 group=
+	std::vector<toggle_group> parsed_groups;
 	std::string line;
 
 	bool in_section = false;
 	bool in_settings = false;
+	bool in_group_section = false;
 	bool section_is_legacy_list = false;
 	size_t section_counter = 0;
 	int warnings = 0;
@@ -1809,11 +2041,17 @@ static void load_config(device_data *data)
 	uint32_t parsed_candidate_columns = UINT32_MAX; // UINT32_MAX = INI 里没写
 
 	texture_override_rule current;
+	std::string current_group; // 当前规则段里的 group=
 	bool current_valid = true;
 	bool current_has_hash = false;
 	size_t section_line = 0;
 	size_t error_line = 0;
 	std::string section_display;
+
+	// [ToggleGroup_*] 段的暂存
+	std::string group_name;
+	uint32_t group_hotkey = 0;
+	bool group_active = true;
 
 	auto report_skip = [&](const char *reason, size_t at_line)
 	{
@@ -1877,6 +2115,7 @@ static void load_config(device_data *data)
 			if (current.name.empty())
 				current.name = "TextureOverride_" + std::to_string(section_counter);
 			parsed.push_back(current);
+			parsed_group_names.push_back(current_group);
 		}
 		else if (!section_is_legacy_list)
 		{
@@ -1887,11 +2126,42 @@ static void load_config(device_data *data)
 		}
 
 		current = {};
+		current_group.clear();
 		current_valid = true;
 		current_has_hash = false;
 		section_line = 0;
 		error_line = 0;
 		section_display.clear();
+	};
+
+	// [ToggleGroup_*] 段结束：收进 parsed_groups（重名时保留第一个）
+	auto flush_group = [&]()
+	{
+		if (!in_group_section)
+			return;
+
+		in_group_section = false;
+
+		toggle_group group;
+		group.name = trim_copy(group_name);
+		if (group.name.empty())
+			group.name = "Group " + std::to_string(section_counter);
+		group.hotkey = group_hotkey;
+		group.active = group_active;
+		group.persistent = true;
+
+		if (find_group_index(parsed_groups, group.name) >= 0)
+		{
+			log_warn("[Config] duplicate ToggleGroup name; the first section wins");
+		}
+		else
+		{
+			parsed_groups.push_back(std::move(group));
+		}
+
+		group_name.clear();
+		group_hotkey = 0;
+		group_active = true;
 	};
 
 	while (std::getline(file, line))
@@ -1927,13 +2197,26 @@ static void load_config(device_data *data)
 		if (trimmed.front() == '[' && trimmed.back() == ']')
 		{
 			flush();
+			flush_group();
 
 			++section_counter;
 			const std::string section = lower_copy(trimmed.substr(1, trimmed.size() - 2));
 			in_section = section.compare(0, 15, "textureoverride") == 0;
 			in_settings = (section == "settings");
+			in_group_section = section.compare(0, 11, "togglegroup") == 0;
 			section_is_legacy_list = in_section && section == "textureoverride";
+
+			if (in_group_section)
+			{
+				// 组名以 name= 为准；没写 name 时退回段名
+				group_name = trimmed.substr(1, trimmed.size() - 2);
+				group_hotkey = 0;
+				group_active = true;
+				continue;
+			}
+
 			current = {};
+			current_group.clear();
 			current_valid = true;
 			current_has_hash = false;
 			current.name = trimmed.substr(1, trimmed.size() - 2);
@@ -1943,7 +2226,7 @@ static void load_config(device_data *data)
 			continue;
 		}
 
-		if (!in_section && !in_settings)
+		if (!in_section && !in_settings && !in_group_section)
 			continue;
 
 		const size_t equals = trimmed.find('=');
@@ -1952,6 +2235,32 @@ static void load_config(device_data *data)
 
 		const std::string key = lower_copy(trim_copy(trimmed.substr(0, equals)));
 		const std::string value = trim_copy(trimmed.substr(equals + 1));
+
+		if (in_group_section)
+		{
+			if (key == "name")
+			{
+				group_name = value;
+			}
+			else if (key == "hotkey")
+			{
+				uint32_t packed = 0;
+				if (!parse_hotkey_value(value, packed))
+					log_warn("[Config] ToggleGroup hotkey is invalid; ignored");
+				else
+					group_hotkey = packed;
+			}
+			else if (key == "active")
+			{
+				if (value == "0")
+					group_active = false;
+				else if (value == "1")
+					group_active = true;
+				else
+					log_warn("[Config] ToggleGroup active must be 0 or 1; ignored");
+			}
+			continue;
+		}
 
 		if (in_settings)
 		{
@@ -1996,6 +2305,7 @@ static void load_config(device_data *data)
 				rule.handling = handling_mode::skip;
 				rule.order = parsed.size();
 				parsed.push_back(rule);
+				parsed_group_names.emplace_back();
 			}
 
 			// 让该 section 结束时 flush 不产生“缺少 hash”的警告
@@ -2094,23 +2404,24 @@ static void load_config(device_data *data)
 		{
 			// 打包值：(vk << 24) | (alt << 16) | (ctrl << 8) | shift
 			uint32_t packed = 0;
-			if (!parse_u32(value, packed))
+			if (!parse_hotkey_value(value, packed))
 			{
 				mark_invalid("hotkey must be a packed 32-bit value (use the in-game capture box)");
-			}
-			else if (packed != 0 && ((packed >> 24) & 0xFFu) == 0)
-			{
-				mark_invalid("hotkey has no key code in the high byte");
 			}
 			else
 			{
 				current.hotkey = packed;
 			}
 		}
+		else if (key == "group")
+		{
+			current_group = value; // 归属的 Toggle Group 名（空 = 自成一组）
+		}
 		// 其他键忽略（例如 3DMigoto 的 ps-t0 / vb0 / ib，本插件不处理）
 	}
 
 	flush();
+	flush_group();
 
 	if (parsed_candidate_columns != UINT32_MAX)
 		data->candidate_columns.store(parsed_candidate_columns, std::memory_order_relaxed);
@@ -2131,7 +2442,54 @@ static void load_config(device_data *data)
 
 	const size_t loaded_count = parsed.size();
 
-	publish_rules(data, std::move(parsed));
+	// 组归属解析：显式 [ToggleGroup_*] 优先；规则写了 group= 但没有对应段，
+	// 或者根本没写 group=（旧格式，name= 就是组名），都按需补一个隐式组。
+	// 隐式组的 active / hotkey 取它第一条规则的值，旧文件因此行为完全不变。
+	for (size_t i = 0; i < parsed.size(); ++i)
+	{
+		texture_override_rule &rule = parsed[i];
+
+		std::string group_name_resolved = trim_copy(parsed_group_names[i]);
+		if (group_name_resolved.empty())
+			group_name_resolved = rule.name;
+
+		int index = find_group_index(parsed_groups, group_name_resolved);
+		if (index < 0)
+		{
+			toggle_group group;
+			group.name = group_name_resolved;
+			group.hotkey = rule.hotkey;
+			group.active = rule.active;
+			group.persistent = false;
+			parsed_groups.push_back(std::move(group));
+			index = static_cast<int>(parsed_groups.size()) - 1;
+		}
+
+		rule.group = static_cast<size_t>(index);
+	}
+
+	// 显式组没写 hotkey、但组内规则写了：沿用规则的值（手写 INI 常见写法，
+	// 免得升级后热键突然失效）。组写了 hotkey 时以组为准。
+	for (size_t g = 0; g < parsed_groups.size(); ++g)
+	{
+		if (parsed_groups[g].hotkey != 0)
+			continue;
+
+		for (const texture_override_rule &rule : parsed)
+		{
+			if (rule.group == g && rule.hotkey != 0)
+			{
+				parsed_groups[g].hotkey = rule.hotkey;
+				break;
+			}
+		}
+	}
+
+	rule_set set;
+	set.rules = std::move(parsed);
+	set.groups = std::move(parsed_groups);
+
+	publish_rules(data, std::move(set));
 
 	char message[160];
 	std::snprintf(message, sizeof(message), "[Config] loaded %u rules",
@@ -2151,7 +2509,7 @@ static void load_config(device_data *data)
 // -----------------------------------------------------------------------------
 // INI 保存
 // -----------------------------------------------------------------------------
-static bool save_config(std::vector<texture_override_rule> rules, int hash_mode_value, bool safe_mode,
+static bool save_config(const rule_set &set, int hash_mode_value, bool safe_mode,
 	uint32_t candidate_columns)
 {
 	const std::filesystem::path path = get_config_path();
@@ -2170,7 +2528,9 @@ static bool save_config(std::vector<texture_override_rule> rules, int hash_mode_
 		file << "; hash        = texture hash (descriptor or pixel, see hash_mode); * = any texture\n";
 		file << "; match_ps_hash = CRC32C of the pixel shader DXBC (stable across restarts)\n";
 		file << "; match_vs_hash = CRC32C of the vertex shader DXBC (stable across restarts)\n";
-		file << "; conditions inside one section are AND; sections are OR (higher match_priority wins)\n\n";
+		file << "; conditions inside one section are AND; sections are OR (higher match_priority wins)\n";
+		file << "; [ToggleGroup_n] owns one hotkey + one active switch for all rules that reference\n";
+		file << "; it via group=; a rule without group= forms its own implicit group named by name=\n\n";
 
 		file << "[Settings]\n";
 		file << "hash_mode = "
@@ -2180,24 +2540,47 @@ static bool save_config(std::vector<texture_override_rule> rules, int hash_mode_
 		file << "; candidate_columns: which fields the candidate list shows (tex ps vs fi ic)\n";
 		file << "candidate_columns = " << candidate_columns_to_string(candidate_columns) << "\n\n";
 
-		for (size_t i = 0; i < rules.size(); ++i)
+		// ---- Toggle Groups ----
+		// 只写"有规则"或"用户显式建的空组"：狩猎过程中自动生成的隐式组
+		// 不该在用户删光规则后还留在文件里。
+		std::vector<bool> group_has_rules(set.groups.size(), false);
+		for (const texture_override_rule &rule : set.rules)
 		{
-			const texture_override_rule &rule = rules[i];
+			if (rule.group < group_has_rules.size())
+				group_has_rules[rule.group] = true;
+		}
+
+		for (size_t i = 0; i < set.groups.size(); ++i)
+		{
+			const toggle_group &group = set.groups[i];
+			if (!group_has_rules[i] && !group.persistent)
+				continue;
+
+			file << "[ToggleGroup_" << i << "]\n";
+			// 组名同时也是规则里 group= 的引用键：两处必须用同一份转义
+			file << "name = " << sanitize_ini_text(group.name) << "\n";
+			if (group.hotkey != 0)
+			{
+				char hotkey_text[16];
+				std::snprintf(hotkey_text, sizeof(hotkey_text), "0x%08X", group.hotkey);
+				file << "hotkey = " << hotkey_text << "\n";
+			}
+			file << "active = " << (group.active ? 1 : 0) << "\n\n";
+		}
+
+		for (size_t i = 0; i < set.rules.size(); ++i)
+		{
+			const texture_override_rule &rule = set.rules[i];
 
 			file << "[TextureOverride_" << i << "]\n";
 
 			// 组名单独存成 name=，section 名保持 [TextureOverride_<i>] 不变——
 			// 加载器只认 "textureoverride" 前缀，改名会直接丢掉整段规则。
 			if (!rule.name.empty())
-			{
-				std::string safe_name;
-				for (char ch : rule.name)
-				{
-					// ';' / '#' / CR / LF 会破坏手写 INI 语法，统一替换
-					safe_name += (ch == ';' || ch == '#' || ch == '\r' || ch == '\n') ? '_' : ch;
-				}
-				file << "name = " << safe_name << "\n";
-			}
+				file << "name = " << sanitize_ini_text(rule.name) << "\n";
+
+			if (rule.group < set.groups.size())
+				file << "group = " << sanitize_ini_text(set.groups[rule.group].name) << "\n";
 
 			if (rule.hash_any)
 			{
@@ -2235,15 +2618,8 @@ static bool save_config(std::vector<texture_override_rule> rules, int hash_mode_
 			if (rule.priority != 0)
 				file << "match_priority = " << rule.priority << "\n";
 
-			if (rule.hotkey != 0)
-			{
-				char hotkey_text[16];
-				std::snprintf(hotkey_text, sizeof(hotkey_text), "0x%08X", rule.hotkey);
-				file << "hotkey = " << hotkey_text << "\n";
-			}
-
-			file << "handling = " << (rule.handling == handling_mode::skip ? "skip" : "replace") << "\n";
-			file << "active = " << (rule.active ? 1 : 0) << "\n\n";
+			// active / hotkey 属于组，不再逐条写：写了也会在加载时被组覆盖
+			file << "handling = " << (rule.handling == handling_mode::skip ? "skip" : "replace") << "\n\n";
 		}
 
 		file.flush();
@@ -2261,7 +2637,8 @@ static bool save_config(std::vector<texture_override_rule> rules, int hash_mode_
 	}
 
 	char message[128];
-	std::snprintf(message, sizeof(message), "[Config] saved %u rules", static_cast<unsigned>(rules.size()));
+	std::snprintf(message, sizeof(message), "[Config] saved %u rules in %u groups",
+		static_cast<unsigned>(set.rules.size()), static_cast<unsigned>(set.groups.size()));
 	log_info(message);
 	return true;
 }
@@ -3746,20 +4123,22 @@ static void process_rule_hotkeys(device_data *data)
 		return;
 	}
 
-	const rule_table *rules = acquire_rules(data);
-	if (rules == nullptr || rules->rules.empty())
+	const rule_table *table = acquire_rules(data);
+	if (table == nullptr || table->rules.empty())
 		return;
 
 	const bool hunting = data->hunting.load(std::memory_order_relaxed);
 
 	// Hunting 期间 Numpad 1/2/3 属于 Hunting 键，不允许被规则热键抢走
-	static constexpr uint32_t kHumanSpeedLimit = 8;
-	size_t toggles[kHumanSpeedLimit] = {};
+	static constexpr size_t kHumanSpeedLimit = 8;
+	size_t toggled_groups[kHumanSpeedLimit] = {};
 	size_t count = 0;
 
-	for (size_t i = 0; i < rules->rules.size(); ++i)
+	// 按「组」收集：一组多条规则共用一个热键，只能翻转一次，
+	// 否则同组规则会在一次按键里被翻来翻去（奇偶抵消）。
+	for (const texture_override_rule &rule : table->rules)
 	{
-		const uint32_t hotkey = rules->rules[i].hotkey;
+		const uint32_t hotkey = rule.hotkey;
 		if (hotkey == 0 || !hotkey_pressed(hotkey))
 			continue;
 
@@ -3770,29 +4149,39 @@ static void process_rule_hotkeys(device_data *data)
 				continue;
 		}
 
+		if (rule.group >= table->groups.size())
+			continue;
+
 		if (count < kHumanSpeedLimit)
-			toggles[count++] = i;
+			toggled_groups[count++] = rule.group;
 	}
 
 	if (count == 0)
 		return;
 
-	std::vector<texture_override_rule> updated = copy_rules(rules);
+	rule_set set = copy_rule_set(table);
 
 	for (size_t i = 0; i < count; ++i)
 	{
-		texture_override_rule &rule = updated[toggles[i]];
-		rule.active = !rule.active;
+		// 同组只处理一次（上面的收集会有重复下标）
+		bool duplicate = false;
+		for (size_t j = 0; j < i; ++j)
+			duplicate = duplicate || (toggled_groups[j] == toggled_groups[i]);
+		if (duplicate)
+			continue;
+
+		toggle_group &group = set.groups[toggled_groups[i]];
+		group.active = !group.active;
 
 		char message[256];
-		std::snprintf(message, sizeof(message), "[Hotkey] '%s' -> %s (%s)",
-			rule.name.empty() ? "<unnamed>" : rule.name.c_str(),
-			rule.active ? "active" : "disabled",
-			hotkey_to_string(rule.hotkey).c_str());
+		std::snprintf(message, sizeof(message), "[Hotkey] group '%s' -> %s (%s)",
+			group.name.empty() ? "<unnamed>" : group.name.c_str(),
+			group.active ? "active" : "disabled",
+			hotkey_to_string(group.hotkey).c_str());
 		log_info(message);
 	}
 
-	publish_rules(data, std::move(updated));
+	publish_rules(data, std::move(set));
 	data->has_unsaved_changes.store(true, std::memory_order_relaxed);
 }
 
@@ -3898,14 +4287,16 @@ static void toggle_rule_for_candidate(device_data *data)
 		selected = data->candidates[data->candidate_index];
 	}
 
-	std::vector<texture_override_rule> rules = copy_rules(acquire_rules(data));
+	rule_set set = copy_rule_set(acquire_rules(data));
 
 	// 生成规则：默认只写稳定锚点（hash = *），避免图集重排后失效
 	const bool stable_only = data->stable_only_rules.load(std::memory_order_relaxed);
 	const bool has_stable = selected.ps_hash != 0 || selected.vs_hash != 0;
 
+	const std::string default_name = "Hunting_" + std::to_string(set.rules.size());
+
 	texture_override_rule plain;
-	plain.name = "Hunting_" + std::to_string(rules.size());
+	plain.name = default_name;
 	plain.ps_hash = selected.ps_hash;
 	plain.vs_hash = selected.vs_hash;
 	plain.first_index.add(selected.first_index);
@@ -3926,7 +4317,7 @@ static void toggle_rule_for_candidate(device_data *data)
 
 	// 再次按 Numpad 3 / 点击按钮 = 取消：删除所有覆盖该候选的规则
 	size_t removed = 0;
-	for (auto it = rules.begin(); it != rules.end();)
+	for (auto it = set.rules.begin(); it != set.rules.end();)
 	{
 		const bool same_anchor =
 			it->ps_hash == selected.ps_hash && it->vs_hash == selected.vs_hash;
@@ -3937,7 +4328,7 @@ static void toggle_rule_for_candidate(device_data *data)
 
 		if (same_anchor && same_texture && covers_draw)
 		{
-			it = rules.erase(it);
+			it = set.rules.erase(it);
 			++removed;
 		}
 		else
@@ -3948,8 +4339,22 @@ static void toggle_rule_for_candidate(device_data *data)
 
 	char message[192];
 
+	// 先记下当前选中的组名：删除 + 剪枝会重排下标，按名字才能重新对上
+	const int wanted_group = data->selected_group.load(std::memory_order_relaxed);
+	std::string wanted_group_name;
+	if (wanted_group >= 0 && wanted_group < static_cast<int>(set.groups.size()))
+		wanted_group_name = set.groups[wanted_group].name;
+
 	if (removed != 0)
 	{
+		// 删掉的规则可能让某个隐式组变空，顺手收掉
+		prune_implicit_groups(set);
+
+		// 选中项按名字重解析：组被收掉就变成"未选中"
+		data->selected_group.store(
+			wanted_group_name.empty() ? -1 : find_group_index(set.groups, wanted_group_name),
+			std::memory_order_relaxed);
+
 		std::snprintf(message, sizeof(message),
 			"[Hunting] removed %u rule(s) for texture 0x%08X ps=0x%08X vs=0x%08X",
 			static_cast<unsigned>(removed), selected.hash, selected.ps_hash, selected.vs_hash);
@@ -3957,21 +4362,40 @@ static void toggle_rule_for_candidate(device_data *data)
 	}
 	else
 	{
-		rules.push_back(plain);
+		// 新规则归到列表里选中的组；没选中就按规则名新建一个隐式组。
+		// 这样先点一个组再按 Numpad 3，就能把多个候选攒进同一组。
+		if (wanted_group >= 0 && wanted_group < static_cast<int>(set.groups.size()))
+		{
+			plain.group = static_cast<size_t>(wanted_group);
+			plain.name = make_unique_group_name(set.groups, default_name);
+		}
+		else
+		{
+			toggle_group group;
+			group.name = make_unique_group_name(set.groups, default_name);
+			group.active = true;
+			group.persistent = false;
+			set.groups.push_back(std::move(group));
+			plain.group = set.groups.size() - 1;
+			plain.name = set.groups.back().name;
+			data->selected_group.store(static_cast<int>(plain.group), std::memory_order_relaxed);
+		}
+
+		set.rules.push_back(plain);
 
 		char texture_text[16] = "*";
 		if (!plain.hash_any)
 			std::snprintf(texture_text, sizeof(texture_text), "0x%08X", plain.hash);
 
 		std::snprintf(message, sizeof(message),
-			"[Hunting] added rule texture=%s ps=0x%08X vs=0x%08X fi=%u ic=%u",
+			"[Hunting] added rule texture=%s ps=0x%08X vs=0x%08X fi=%u ic=%u (group '%s')",
 			texture_text, selected.ps_hash, selected.vs_hash,
-			selected.first_index, selected.index_count);
+			selected.first_index, selected.index_count, plain.name.c_str());
 		log_info(message);
 	}
 
 	data->has_unsaved_changes.store(true, std::memory_order_relaxed);
-	publish_rules(data, std::move(rules));
+	publish_rules(data, std::move(set));
 
 	// 规则数量变了，Group settings 里记下的下标已失效，必须关掉编辑器，
 	// 否则“Done”会把编辑内容套到另一条规则上（或静默丢弃）。
@@ -4478,25 +4902,31 @@ static void draw_overlay(effect_runtime *runtime)
 		data->settings_open = false;
 		data->settings_index = -1;
 		data->settings_error.clear();
+		data->group_settings_open = false;
+		data->group_settings_index = -1;
+		data->group_settings_error.clear();
+		// 注意：**不要**清 selected_group。Numpad 3 生成规则时也会发这个请求
+		// （规则数变化 → 编辑器下标失效要关窗），清掉选中就会让"先选组、
+		// 再连着按 3 把多个候选攒进同一组"直接失效。
 		// 关掉编辑器的同时退出热键捕获态，否则规则热键会被永久抑制
-		data->edit_hotkey_capturing = false;
+		data->edit_group_hotkey_capturing = false;
 		data->capturing_hotkey.store(false, std::memory_order_relaxed);
 	}
 
-	// 消费 present 线程捕获到的热键（seq 变化 = 有新结果）
+	// 消费 present 线程捕获到的热键（seq 变化 = 有新结果）。
+	// 热键只有一个来源：组的快捷键（规则不再各自持有热键）。
 	{
 		const uint32_t capture_seq = data->hotkey_capture_seq.load(std::memory_order_relaxed);
 		if (capture_seq != data->hotkey_capture_seq_seen)
 		{
 			data->hotkey_capture_seq_seen = capture_seq;
-			data->edit_hotkey = data->captured_hotkey.load(std::memory_order_relaxed);
-			data->edit_hotkey_capturing = false;
+			data->edit_group_hotkey = data->captured_hotkey.load(std::memory_order_relaxed);
+			data->edit_group_hotkey_capturing = false;
 		}
-		else if (data->edit_hotkey_capturing &&
-			!data->capturing_hotkey.load(std::memory_order_relaxed))
+		else if (!data->capturing_hotkey.load(std::memory_order_relaxed))
 		{
 			// 捕获态在别处结束（窗口被关、请求关闭等）：同步 UI，别卡在"按任意键"
-			data->edit_hotkey_capturing = false;
+			data->edit_group_hotkey_capturing = false;
 		}
 	}
 
@@ -4529,6 +4959,8 @@ static void draw_overlay(effect_runtime *runtime)
 		std::vector<candidate> candidates;
 		int candidate_index = -1;
 		std::vector<texture_override_rule> rules;
+		std::vector<toggle_group> groups;
+		int selected_group = -1;
 	} snapshot;
 
 	{
@@ -4559,12 +4991,17 @@ static void draw_overlay(effect_runtime *runtime)
 		snapshot.skipped = data->draws_skipped.load(std::memory_order_relaxed);
 		snapshot.candidates = data->candidates;
 		snapshot.candidate_index = data->candidate_index;
+		snapshot.selected_group = data->selected_group.load(std::memory_order_relaxed);
 	}
 
 	// 规则表是独立原子指针 + 不可变快照，拷贝不需要 data->mutex。
 	// publish_rules（唯一回收旧表的地方）与 overlay 同在 present 线程，
 	// 因此拷贝期间指针不会被回收。
-	snapshot.rules = copy_rules(acquire_rules(data));
+	{
+		rule_set set = copy_rule_set(acquire_rules(data));
+		snapshot.rules = std::move(set.rules);
+		snapshot.groups = std::move(set.groups);
+	}
 
 	// 2) 锁外绘制，只记录意图
 	bool hunting_changed = false;
@@ -4583,12 +5020,27 @@ static void draw_overlay(effect_runtime *runtime)
 	bool reload_requested = false;
 
 	int remove_index = -1;
-	int active_index = -1;
-	bool active_value = true;
 	int open_settings_index = -1;
 	bool apply_settings = false;
 	int apply_settings_index = -1;
 	texture_override_rule apply_settings_rule;
+	std::string apply_settings_group;
+
+	// 组级意图
+	int selected_group = snapshot.selected_group;
+	// 选中的组用**名字**记账：任何一次 publish 都可能因为删组/剪枝重排下标，
+	// 只记下标会在下一帧选到另一组上。
+	std::string selected_group_name;
+	if (selected_group >= 0 && selected_group < static_cast<int>(snapshot.groups.size()))
+		selected_group_name = snapshot.groups[selected_group].name;
+	int group_active_index = -1;
+	bool group_active_value = true;
+	int group_remove_index = -1;
+	bool new_group_requested = false;
+	int open_group_settings_index = -1;
+	bool apply_group_settings = false;
+	int apply_group_settings_index = -1;
+	toggle_group apply_group_settings_value;
 
 	int view_index = snapshot.candidate_index;
 	const int candidate_count = static_cast<int>(snapshot.candidates.size());
@@ -4903,21 +5355,23 @@ static void draw_overlay(effect_runtime *runtime)
 
 		ImGui::Separator();
 
-		// ---- List of Toggle Groups（对齐 ShaderToggler 的行式列表）----
-		// 组的来源就是规则：Hunting（Numpad 3）建组，或手写 INI。
-		// 布局用表格：X 放最右（防误触），热键列右对齐，组名拉伸。
+		// ---- List of Toggle Groups ----
+		// 一行 = 一个组：一个热键 + 一个 Active 开关，管住组内**所有**规则。
+		// 展开组可以看到它下面的每条规则（以及行内 Edit / X）。
+		// 布局：X 放最右（防误触），热键列右对齐，组名拉伸。
 		if (ImGui::CollapsingHeader("List of Toggle Groups", ImGuiTreeNodeFlags_DefaultOpen))
 		{
-			ImGui::TextDisabled("Groups are created with Hunting Mode (Numpad 3) or by editing the INI.");
+			ImGui::TextDisabled("One hotkey + one Active switch per group. Expand a group to see its rules.");
+			ImGui::TextDisabled("Select a group first, then press Numpad 3 while hunting to add the candidate to it.");
 
-			ImGui::BeginChild("##groups", ImVec2(0.0f, 150.0f), true);
+			ImGui::BeginChild("##groups", ImVec2(0.0f, 190.0f), true, ImGuiWindowFlags_HorizontalScrollbar);
 
 			const ImGuiTableFlags group_table_flags =
 				ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoPadOuterX;
 
 			if (ImGui::BeginTable("##group_table", 7, group_table_flags))
 			{
-				ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 26.0f);
+				ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 30.0f);
 				ImGui::TableSetupColumn("Act", ImGuiTableColumnFlags_WidthFixed, 26.0f);
 				ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 44.0f);   // Edit
 				ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 46.0f);   // Hunt
@@ -4926,26 +5380,44 @@ static void draw_overlay(effect_runtime *runtime)
 				ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 26.0f);   // X（最右，防误触）
 				ImGui::TableHeadersRow();
 
-				for (int i = 0; i < static_cast<int>(snapshot.rules.size()); ++i)
+				for (int g = 0; g < static_cast<int>(snapshot.groups.size()); ++g)
 				{
-					const texture_override_rule &rule = snapshot.rules[i];
-					ImGui::PushID(2000 + i);
+					const toggle_group &group = snapshot.groups[g];
+
+					int rule_count = 0;
+					for (const texture_override_rule &rule : snapshot.rules)
+					{
+						if (rule.group == static_cast<size_t>(g))
+							++rule_count;
+					}
+
+					ImGui::PushID(2000 + g);
 					ImGui::TableNextRow();
 
+					// 选中这一组：Numpad 3 的新规则会加进来
 					ImGui::TableSetColumnIndex(0);
-					ImGui::Text("%d", i);
+					if (ImGui::Selectable(std::to_string(g).c_str(), selected_group == g,
+						0, ImVec2(ImGui::GetColumnWidth() - ImGui::GetStyle().CellPadding.x * 2.0f, 0.0f)))
+					{
+						selected_group = g;
+						selected_group_name = group.name;
+					}
+					if (ImGui::IsItemHovered())
+						ImGui::SetTooltip("Select this group (new rules from Numpad 3 join it)");
 
 					ImGui::TableSetColumnIndex(1);
-					bool group_active = rule.active;
+					bool group_active = group.active;
 					if (ImGui::Checkbox("##group_active", &group_active))
 					{
-						active_index = i;
-						active_value = group_active;
+						group_active_index = g;
+						group_active_value = group_active;
 					}
 
 					ImGui::TableSetColumnIndex(2);
 					if (ImGui::Button("Edit"))
-						open_settings_index = i;
+						open_group_settings_index = g;
+					if (ImGui::IsItemHovered())
+						ImGui::SetTooltip("Rename / rebind this group");
 
 					ImGui::TableSetColumnIndex(3);
 					if (ImGui::Button("Hunt"))
@@ -4962,19 +5434,96 @@ static void draw_overlay(effect_runtime *runtime)
 						ImGui::SetTooltip("Enable Hunting Mode (keeps the current candidate list)");
 
 					ImGui::TableSetColumnIndex(4);
-					ImGui::TextUnformatted(rule.name.empty() ? "<unnamed>" : rule.name.c_str());
-					if (!rule.active)
 					{
-						ImGui::SameLine();
-						ImGui::TextDisabled("(disabled)");
+						char label[192];
+						std::snprintf(label, sizeof(label), "%s  (%d rule%s)",
+							group.name.empty() ? "<unnamed>" : group.name.c_str(),
+							rule_count,
+							rule_count == 1 ? "" : "s");
+
+						const bool group_open = ImGui::TreeNodeEx(label,
+							ImGuiTreeNodeFlags_SpanAvailWidth |
+							((selected_group == g) ? ImGuiTreeNodeFlags_Selected : 0));
+
+						// 点组名（不点箭头）也算选中，符合"先选组再造规则"的操作顺序
+						if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
+						{
+							selected_group = g;
+							selected_group_name = group.name;
+						}
+
+						if (!group.active)
+						{
+							ImGui::SameLine();
+							ImGui::TextDisabled("(disabled)");
+						}
+
+						if (ImGui::IsItemHovered())
+							ImGui::SetTooltip("%s", group.name.c_str());
+
+						// 展开：逐条列出组内规则，Edit / X 与上面的按钮列对齐
+						if (group_open)
+						{
+							for (int r = 0; r < static_cast<int>(snapshot.rules.size()); ++r)
+							{
+								const texture_override_rule &rule = snapshot.rules[r];
+								if (rule.group != static_cast<size_t>(g))
+									continue;
+
+								ImGui::PushID(4000 + r);
+								ImGui::TableNextRow();
+
+								ImGui::TableSetColumnIndex(2);
+								if (ImGui::Button("Edit"))
+									open_settings_index = r;
+
+								ImGui::TableSetColumnIndex(4);
+								{
+									char summary[256];
+									const std::string first = value_set_to_string(rule.first_index);
+									const std::string count_text = value_set_to_string(rule.index_count);
+
+									char texture_text[16];
+									if (rule.hash_any)
+										std::snprintf(texture_text, sizeof(texture_text), "*");
+									else
+										std::snprintf(texture_text, sizeof(texture_text), "0x%08X", rule.hash);
+
+									std::snprintf(summary, sizeof(summary),
+										"    %s  fi=%s  ic=%s  %s",
+										texture_text,
+										first.empty() ? "*" : first.c_str(),
+										count_text.empty() ? "*" : count_text.c_str(),
+										rule.handling == handling_mode::skip ? "skip" : "replace");
+									ImGui::TextDisabled("%s", summary);
+								}
+
+								if (ImGui::IsItemHovered())
+								{
+									ImGui::BeginTooltip();
+									ImGui::Text("ps: 0x%08X", rule.ps_hash);
+									ImGui::Text("vs: 0x%08X", rule.vs_hash);
+									ImGui::Text("priority: %d", rule.priority);
+									ImGui::EndTooltip();
+								}
+
+								ImGui::TableSetColumnIndex(6);
+								if (ImGui::Button("X"))
+									remove_index = r;
+
+								ImGui::PopID();
+							}
+
+							ImGui::TreePop();
+						}
 					}
 
 					ImGui::TableSetColumnIndex(5);
 					{
 						// 右对齐：用列宽算偏移（GetContentRegionAvail 在表格单元里是窗口级，
 						// 会算到列外去，所以这里必须用 GetColumnWidth）
-						const std::string key_text = rule.hotkey != 0
-							? hotkey_to_string(rule.hotkey)
+						const std::string key_text = group.hotkey != 0
+							? hotkey_to_string(group.hotkey)
 							: std::string("[No Key]");
 
 						const float text_width = ImGui::CalcTextSize(key_text.c_str()).x;
@@ -4982,7 +5531,7 @@ static void draw_overlay(effect_runtime *runtime)
 						if (offset > 0.0f)
 							ImGui::SetCursorPosX(ImGui::GetCursorPosX() + offset);
 
-						if (rule.hotkey != 0)
+						if (group.hotkey != 0)
 							ImGui::TextUnformatted(key_text.c_str());
 						else
 							ImGui::TextDisabled("%s", key_text.c_str());
@@ -4990,9 +5539,19 @@ static void draw_overlay(effect_runtime *runtime)
 
 					ImGui::TableSetColumnIndex(6);
 					if (ImGui::Button("X"))
-						remove_index = i;
+					{
+						if (rule_count != 0)
+						{
+							data->pending_delete_group = g;
+							ImGui::OpenPopup("delete_group_confirm");
+						}
+						else
+						{
+							group_remove_index = g;
+						}
+					}
 					if (ImGui::IsItemHovered())
-						ImGui::SetTooltip("Delete this group");
+						ImGui::SetTooltip("Delete this group and all of its rules");
 
 					ImGui::PopID();
 				}
@@ -5000,17 +5559,63 @@ static void draw_overlay(effect_runtime *runtime)
 				ImGui::EndTable();
 			}
 
-			if (snapshot.rules.empty())
+			// 组删除确认：组里还有规则时必须过一道，避免一次误触清掉整组
+			if (ImGui::BeginPopupModal("delete_group_confirm", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+			{
+				const int pending = data->pending_delete_group;
+				if (pending >= 0 && pending < static_cast<int>(snapshot.groups.size()))
+				{
+					int rule_count = 0;
+					for (const texture_override_rule &rule : snapshot.rules)
+					{
+						if (rule.group == static_cast<size_t>(pending))
+							++rule_count;
+					}
+
+					ImGui::Text("Delete group \"%s\" and its %d rule(s)?",
+						snapshot.groups[pending].name.c_str(), rule_count);
+					ImGui::TextDisabled("This cannot be undone (the INI keeps the old content until Save to INI).");
+				}
+				else
+				{
+					ImGui::TextUnformatted("Delete the selected group?");
+				}
+
+				ImGui::Separator();
+
+				if (ImGui::Button("Delete", ImVec2(110.0f, 0.0f)))
+				{
+					group_remove_index = data->pending_delete_group;
+					data->pending_delete_group = -1;
+					ImGui::CloseCurrentPopup();
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Cancel", ImVec2(110.0f, 0.0f)))
+				{
+					data->pending_delete_group = -1;
+					ImGui::CloseCurrentPopup();
+				}
+
+				ImGui::EndPopup();
+			}
+
+			if (snapshot.groups.empty())
 				ImGui::TextDisabled("No groups yet.");
 
 			ImGui::EndChild();
+
+			// New 放在列表**下面**：先建空组、再选中它去狩猎攒规则
+			if (ImGui::Button("+ New group"))
+				new_group_requested = true;
+			if (ImGui::IsItemHovered())
+				ImGui::SetTooltip("Create an empty group, select it, then add rules with Numpad 3");
 		}
 
 		ImGui::Separator();
 
-		// 哈希管理 —— 规则的"总账"：每条规则的哈希/区间/热键/模式一目了然，
+		// 哈希管理 —— 规则的"总账"：每条规则的哈希/区间/所属组/模式一目了然，
 		// 并且把编辑与删除都放在这一张表里（不再要求先去 Toggle Groups 找）。
-		// FI / IC 合成一列、热键只在有绑定时显示，都是为了窄面板下不横向溢出。
+		// 热键不在这里显示：它属于组，列在 List of Toggle Groups 里。
 		if (ImGui::CollapsingHeader("Hash management", ImGuiTreeNodeFlags_DefaultOpen))
 		{
 			ImGui::TextDisabled("Every rule with its hash conditions; edit or delete it right here.");
@@ -5022,7 +5627,7 @@ static void draw_overlay(effect_runtime *runtime)
 				ImGui::TableSetupColumn("PS");
 				ImGui::TableSetupColumn("VS");
 				ImGui::TableSetupColumn("FI / IC");
-				ImGui::TableSetupColumn("Key");
+				ImGui::TableSetupColumn("Group");
 				ImGui::TableSetupColumn("Mode");
 				ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 44.0f); // Edit
 				ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 26.0f); // X
@@ -5066,10 +5671,10 @@ static void draw_overlay(effect_runtime *runtime)
 						count_text.empty() ? "*" : count_text.c_str());
 
 					ImGui::TableSetColumnIndex(4);
-					if (rule.hotkey != 0)
-						ImGui::TextUnformatted(hotkey_to_string(rule.hotkey).c_str());
+					if (rule.group < snapshot.groups.size())
+						ImGui::TextUnformatted(snapshot.groups[rule.group].name.c_str());
 					else
-						ImGui::TextDisabled("[No Key]");
+						ImGui::TextDisabled("-");
 
 					ImGui::TableSetColumnIndex(5);
 					ImGui::TextUnformatted(rule.handling == handling_mode::skip ? "skip" : "replace");
@@ -5137,7 +5742,7 @@ static void draw_overlay(effect_runtime *runtime)
 		}
 	}
 
-	// ---------------- 打开设置窗口 ----------------
+	// ---------------- 打开规则设置窗口 ----------------
 	if (open_settings_index >= 0 &&
 		open_settings_index < static_cast<int>(snapshot.rules.size()))
 	{
@@ -5148,12 +5753,13 @@ static void draw_overlay(effect_runtime *runtime)
 		data->settings_error.clear();
 		data->edit_priority = rule.priority;
 		data->edit_handling = rule.handling == handling_mode::skip ? 0 : 1;
-		data->edit_active = rule.active;
-		// 组名（写回 INI 的 name=，面板与"List of Toggle Groups"都显示它）
+		// 组名（写回 INI 的 name=，Hash management 显示它）
 		std::snprintf(data->edit_name, sizeof(data->edit_name), "%s", rule.name.c_str());
-		// 热键编辑：进入时把当前绑定拷进编辑缓冲，捕获状态清零
-		data->edit_hotkey = rule.hotkey;
-		data->edit_hotkey_capturing = false;
+		std::snprintf(data->edit_rule_group, sizeof(data->edit_rule_group), "%s",
+			rule.group < snapshot.groups.size() ? snapshot.groups[rule.group].name.c_str() : "");
+
+		// 进编辑器时退出任何热键捕获态（热键现在是组级属性，规则编辑器里不编辑它）
+		data->edit_group_hotkey_capturing = false;
 		data->capturing_hotkey.store(false, std::memory_order_relaxed);
 
 		const std::string first = value_set_to_string(rule.first_index);
@@ -5178,14 +5784,30 @@ static void draw_overlay(effect_runtime *runtime)
 		std::snprintf(data->edit_count, sizeof(data->edit_count), "%s", count_text.c_str());
 	}
 
-	// ---------------- Group settings ----------------
+	// ---------------- 打开组设置窗口 ----------------
+	if (open_group_settings_index >= 0 &&
+		open_group_settings_index < static_cast<int>(snapshot.groups.size()))
+	{
+		const toggle_group &group = snapshot.groups[open_group_settings_index];
+
+		data->group_settings_open = true;
+		data->group_settings_index = open_group_settings_index;
+		data->group_settings_error.clear();
+		std::snprintf(data->edit_group_name, sizeof(data->edit_group_name), "%s", group.name.c_str());
+		data->edit_group_active = group.active;
+		data->edit_group_hotkey = group.hotkey;
+		data->edit_group_hotkey_capturing = false;
+		data->capturing_hotkey.store(false, std::memory_order_relaxed);
+	}
+
+	// ---------------- Rule settings ----------------
 	if (data->settings_open)
 	{
 		bool window_open = true;
 		bool settings_done = false;
 
-		ImGui::SetNextWindowSize(ImVec2(520.0f, 620.0f), ImGuiCond_FirstUseEver);
-		ImGui::Begin("Group settings", &window_open);
+		ImGui::SetNextWindowSize(ImVec2(520.0f, 520.0f), ImGuiCond_FirstUseEver);
+		ImGui::Begin("Rule settings", &window_open);
 
 		if (data->settings_index < 0)
 		{
@@ -5193,8 +5815,7 @@ static void draw_overlay(effect_runtime *runtime)
 		}
 		else
 		{
-			// 字段区放进可滚动子窗口：窗口被缩小时热键行不会"掉到看不见的地方"
-			// （之前固定 480x460，加了 name / hotkey 两行后就超出可视区）。
+			// 字段区放进可滚动子窗口：窗口被缩小时最后几行不会"掉到看不见的地方"。
 			ImGui::BeginChild("##settings_body", ImVec2(0.0f, -56.0f), false);
 
 			if (data->focus_hash_next)
@@ -5205,12 +5826,37 @@ static void draw_overlay(effect_runtime *runtime)
 
 			ImGui::TextDisabled("Conditions are AND; empty / * means \"any\".");
 			ImGui::InputText("name", data->edit_name, sizeof(data->edit_name));
+			ImGui::InputText("group", data->edit_rule_group, sizeof(data->edit_rule_group));
+			if (ImGui::IsItemHovered())
+				ImGui::SetTooltip("Type an existing group name to join it, or a new name to create one.\n"
+					"Empty = this rule forms its own group. Hotkey / Active belong to the group.");
 			ImGui::InputText("hash (or *)", data->edit_hash, sizeof(data->edit_hash));
 			ImGui::InputText("match_ps_hash", data->edit_ps, sizeof(data->edit_ps));
 			ImGui::InputText("match_vs_hash", data->edit_vs, sizeof(data->edit_vs));
 			ImGui::InputText("match_first_index", data->edit_first, sizeof(data->edit_first));
 			ImGui::InputText("match_index_count", data->edit_count, sizeof(data->edit_count));
 			ImGui::InputInt("match_priority", &data->edit_priority);
+
+			// 现有组名一览：点一下就能填进上面的 group 输入框
+			if (!snapshot.groups.empty())
+			{
+				ImGui::TextDisabled("Existing groups:");
+				for (size_t g = 0; g < snapshot.groups.size(); ++g)
+				{
+					const char *name = snapshot.groups[g].name.c_str();
+					const float needed = ImGui::CalcTextSize(name).x +
+						ImGui::GetStyle().FramePadding.x * 2.0f + ImGui::GetStyle().ItemSpacing.x;
+
+					// 放不下就换行，别把按钮挤出窗口外
+					if (g != 0 && ImGui::GetContentRegionAvail().x < needed)
+						ImGui::NewLine();
+					else
+						ImGui::SameLine();
+
+					if (ImGui::SmallButton(name))
+						std::snprintf(data->edit_rule_group, sizeof(data->edit_rule_group), "%s", name);
+				}
+			}
 
 			const char *handling_items[] = { "skip", "replace" };
 			const std::string live_hash = trim_copy(data->edit_hash);
@@ -5230,70 +5876,7 @@ static void draw_overlay(effect_runtime *runtime)
 				ImGui::Combo("handling", &data->edit_handling, handling_items, 2);
 			}
 
-			ImGui::Checkbox("Active", &data->edit_active);
-
-			// ---- 运行时热键（捕获式）----
-			// 捕获在 present 线程完成（process_hotkey_capture），这里只发起请求、显示结果。
-			{
-				ImGui::Separator();
-				ImGui::TextDisabled("Runtime shortcut (toggles this rule in-game)");
-
-				if (data->edit_hotkey_capturing)
-				{
-					ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
-						"Press any key now (Esc cancels, Backspace clears)...");
-
-					if (ImGui::Button("Cancel capture"))
-					{
-						data->edit_hotkey_capturing = false;
-						data->capturing_hotkey.store(false, std::memory_order_relaxed);
-					}
-				}
-				else
-				{
-					if (ImGui::Button("Capture shortcut"))
-					{
-						data->edit_hotkey_capturing = true;
-						data->capturing_hotkey.store(true, std::memory_order_relaxed);
-						log_info("[Hotkey] capture started; press any key");
-					}
-
-					ImGui::SameLine();
-					if (ImGui::Button("Clear"))
-						data->edit_hotkey = 0;
-
-					ImGui::SameLine();
-					ImGui::Text("Current: %s", hotkey_to_string(data->edit_hotkey).c_str());
-				}
-
-				// 与其它规则撞键时提示（两边都会触发；不阻止）
-				if (data->edit_hotkey != 0)
-				{
-					int conflicts = 0;
-					for (int i = 0; i < static_cast<int>(snapshot.rules.size()); ++i)
-					{
-						if (i == data->settings_index)
-							continue;
-						if (snapshot.rules[i].hotkey == data->edit_hotkey)
-							++conflicts;
-					}
-
-					if (conflicts != 0)
-					{
-						ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.25f, 1.0f),
-							"Same shortcut is used by %d other rule(s); pressing it toggles all of them.",
-							conflicts);
-					}
-					else
-					{
-						ImGui::TextDisabled("Runtime toggling does not write the INI; press Save to INI to keep it.");
-					}
-				}
-				else
-				{
-					ImGui::TextDisabled("No shortcut yet. Click Capture, then press any key.");
-				}
-			}
+			ImGui::TextDisabled("Rule Active / hotkey are group-level: edit them in List of Toggle Groups.");
 
 			ImGui::EndChild();
 
@@ -5360,9 +5943,8 @@ static void draw_overlay(effect_runtime *runtime)
 					apply_settings_rule.handling = data->edit_handling == 0
 						? handling_mode::skip
 						: handling_mode::replace;
-					apply_settings_rule.active = data->edit_active;
-					apply_settings_rule.hotkey = data->edit_hotkey;
 					apply_settings_rule.name = trim_copy(data->edit_name);
+					apply_settings_group = trim_copy(data->edit_rule_group);
 
 					apply_settings = true;
 					apply_settings_index = data->settings_index;
@@ -5378,10 +5960,142 @@ static void draw_overlay(effect_runtime *runtime)
 		data->settings_open = window_open && !settings_done;
 
 		if (!data->settings_open)
-		{
 			data->settings_index = -1;
-			// 窗口关闭/取消：退出捕获态，否则规则热键会被永久抑制
-			data->edit_hotkey_capturing = false;
+	}
+
+	// ---------------- Toggle group settings ----------------
+	if (data->group_settings_open)
+	{
+		bool window_open = true;
+		bool group_settings_done = false;
+
+		ImGui::SetNextWindowSize(ImVec2(430.0f, 330.0f), ImGuiCond_FirstUseEver);
+		ImGui::Begin("Toggle group", &window_open);
+
+		if (data->group_settings_index < 0)
+		{
+			ImGui::TextDisabled("No group selected.");
+		}
+		else
+		{
+			ImGui::BeginChild("##group_settings_body", ImVec2(0.0f, -56.0f), false);
+
+			ImGui::TextDisabled("All rules in this group share this name, hotkey and switch.");
+			ImGui::InputText("name", data->edit_group_name, sizeof(data->edit_group_name));
+			ImGui::Checkbox("Active", &data->edit_group_active);
+
+			ImGui::Separator();
+			ImGui::TextDisabled("Runtime shortcut (toggles the whole group)");
+
+			// 捕获在 present 线程完成（process_hotkey_capture），这里只发起请求、显示结果。
+			if (data->edit_group_hotkey_capturing)
+			{
+				ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+					"Press any key now (Esc cancels, Backspace clears)...");
+
+				if (ImGui::Button("Cancel capture"))
+				{
+					data->edit_group_hotkey_capturing = false;
+					data->capturing_hotkey.store(false, std::memory_order_relaxed);
+				}
+			}
+			else
+			{
+				if (ImGui::Button("Capture shortcut"))
+				{
+					data->edit_group_hotkey_capturing = true;
+					data->capturing_hotkey.store(true, std::memory_order_relaxed);
+					log_info("[Hotkey] capture started; press any key");
+				}
+
+				ImGui::SameLine();
+				if (ImGui::Button("Clear"))
+					data->edit_group_hotkey = 0;
+
+				ImGui::SameLine();
+				ImGui::Text("Current: %s", hotkey_to_string(data->edit_group_hotkey).c_str());
+			}
+
+			// 与其它组撞键时提示（两边都会触发；不阻止）
+			if (data->edit_group_hotkey != 0)
+			{
+				int conflicts = 0;
+				for (int g = 0; g < static_cast<int>(snapshot.groups.size()); ++g)
+				{
+					if (g == data->group_settings_index)
+						continue;
+					if (snapshot.groups[g].hotkey == data->edit_group_hotkey)
+						++conflicts;
+				}
+
+				if (conflicts != 0)
+				{
+					ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.25f, 1.0f),
+						"Same shortcut is used by %d other group(s); pressing it toggles all of them.",
+						conflicts);
+				}
+				else
+				{
+					ImGui::TextDisabled("Runtime toggling does not write the INI; press Save to INI to keep it.");
+				}
+			}
+			else
+			{
+				ImGui::TextDisabled("No shortcut yet. Click Capture, then press any key.");
+			}
+
+			ImGui::EndChild();
+
+			if (!data->group_settings_error.empty())
+				ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s",
+					data->group_settings_error.c_str());
+
+			if (ImGui::Button("Done", ImVec2(120.0f, 0.0f)))
+			{
+				const std::string new_name = trim_copy(data->edit_group_name);
+
+				bool duplicate = false;
+				for (int g = 0; g < static_cast<int>(snapshot.groups.size()); ++g)
+				{
+					if (g != data->group_settings_index && snapshot.groups[g].name == new_name)
+						duplicate = true;
+				}
+
+				if (new_name.empty())
+				{
+					data->group_settings_error = "Group name cannot be empty.";
+				}
+				else if (duplicate)
+				{
+					data->group_settings_error = "Another group already uses this name.";
+				}
+				else
+				{
+					apply_group_settings_value.name = new_name;
+					apply_group_settings_value.active = data->edit_group_active;
+					apply_group_settings_value.hotkey = data->edit_group_hotkey;
+					apply_group_settings_value.persistent = true;
+
+					apply_group_settings = true;
+					apply_group_settings_index = data->group_settings_index;
+
+					data->group_settings_index = -1;
+					data->group_settings_error.clear();
+					data->edit_group_hotkey_capturing = false;
+					data->capturing_hotkey.store(false, std::memory_order_relaxed);
+					group_settings_done = true;
+				}
+			}
+		}
+
+		ImGui::End();
+		data->group_settings_open = window_open && !group_settings_done;
+
+		if (!data->group_settings_open)
+		{
+			data->group_settings_index = -1;
+			// 窗口关闭/取消：退出捕获态，否则组热键会被永久抑制
+			data->edit_group_hotkey_capturing = false;
 			data->capturing_hotkey.store(false, std::memory_order_relaxed);
 		}
 	}
@@ -5470,12 +6184,13 @@ static void draw_overlay(effect_runtime *runtime)
 
 	if (remove_index >= 0)
 	{
-		std::vector<texture_override_rule> rules = copy_rules(acquire_rules(data));
+		rule_set set = copy_rule_set(acquire_rules(data));
 
-		if (remove_index < static_cast<int>(rules.size()))
+		if (remove_index < static_cast<int>(set.rules.size()))
 		{
-			rules.erase(rules.begin() + remove_index);
-			publish_rules(data, std::move(rules));
+			// remove_rule 会在隐式组变空时顺手把组也收掉
+			remove_rule(set, static_cast<size_t>(remove_index));
+			publish_rules(data, std::move(set));
 
 			if (data->settings_index == remove_index)
 			{
@@ -5495,30 +6210,127 @@ static void draw_overlay(effect_runtime *runtime)
 		}
 	}
 
-	if (active_index >= 0)
+	if (group_active_index >= 0)
 	{
-		std::vector<texture_override_rule> rules = copy_rules(acquire_rules(data));
+		rule_set set = copy_rule_set(acquire_rules(data));
 
-		if (active_index < static_cast<int>(rules.size()))
+		if (group_active_index < static_cast<int>(set.groups.size()))
 		{
-			rules[active_index].active = active_value;
-			publish_rules(data, std::move(rules));
+			set.groups[group_active_index].active = group_active_value;
+			publish_rules(data, std::move(set));
 			data->has_unsaved_changes.store(true, std::memory_order_relaxed);
+
+			char message[192];
+			std::snprintf(message, sizeof(message), "[Groups] '%s' -> %s",
+				snapshot.groups[group_active_index].name.c_str(),
+				group_active_value ? "active" : "disabled");
+			log_info(message);
+		}
+	}
+
+	if (group_remove_index >= 0)
+	{
+		rule_set set = copy_rule_set(acquire_rules(data));
+
+		if (group_remove_index < static_cast<int>(set.groups.size()))
+		{
+			const std::string removed_name = set.groups[group_remove_index].name;
+
+			char message[192];
+			std::snprintf(message, sizeof(message), "[Groups] removed '%s'", removed_name.c_str());
+			log_info(message);
+
+			remove_group(set, static_cast<size_t>(group_remove_index));
+			publish_rules(data, std::move(set));
+			data->has_unsaved_changes.store(true, std::memory_order_relaxed);
+
+			// 索引全变了：关掉两个编辑器，避免把内容套到别的规则/组上
+			data->settings_open = false;
+			data->settings_index = -1;
+			data->group_settings_open = false;
+			data->group_settings_index = -1;
+			if (selected_group_name == removed_name)
+			{
+				selected_group = -1;
+				selected_group_name.clear();
+			}
+		}
+	}
+
+	if (new_group_requested)
+	{
+		rule_set set = copy_rule_set(acquire_rules(data));
+
+		toggle_group group;
+		group.name = make_unique_group_name(set.groups, "New group");
+		group.active = true;
+		group.persistent = true;
+		set.groups.push_back(std::move(group));
+
+		selected_group = static_cast<int>(set.groups.size()) - 1;
+		selected_group_name = set.groups.back().name;
+
+		log_info("[Groups] created an empty group; press Numpad 3 while hunting to add rules to it");
+		publish_rules(data, std::move(set));
+		data->has_unsaved_changes.store(true, std::memory_order_relaxed);
+	}
+
+	if (apply_group_settings && apply_group_settings_index >= 0)
+	{
+		rule_set set = copy_rule_set(acquire_rules(data));
+
+		if (apply_group_settings_index < static_cast<int>(set.groups.size()))
+		{
+			toggle_group &group = set.groups[apply_group_settings_index];
+			const std::string old_name = group.name;
+			group.name = apply_group_settings_value.name;
+			group.active = apply_group_settings_value.active;
+			group.hotkey = apply_group_settings_value.hotkey;
+			group.persistent = true;
+
+			// 选中的组被改名了 → 选择跟着走（否则下一帧按名字就找不到了）
+			if (selected_group_name == old_name)
+				selected_group_name = group.name;
+
+			publish_rules(data, std::move(set));
+			data->has_unsaved_changes.store(true, std::memory_order_relaxed);
+			log_info("[Groups] settings applied");
 		}
 	}
 
 	if (apply_settings && apply_settings_index >= 0)
 	{
-		std::vector<texture_override_rule> rules = copy_rules(acquire_rules(data));
+		rule_set set = copy_rule_set(acquire_rules(data));
 
-		if (apply_settings_index < static_cast<int>(rules.size()))
+		if (apply_settings_index < static_cast<int>(set.rules.size()))
 		{
 			// 名字已经在编辑器里编辑过（edit_name），不再用旧值覆盖
 			if (apply_settings_rule.name.empty())
-				apply_settings_rule.name = rules[apply_settings_index].name;
-			rules[apply_settings_index] = std::move(apply_settings_rule);
+				apply_settings_rule.name = set.rules[apply_settings_index].name;
 
-			publish_rules(data, std::move(rules));
+			// group= 输入框：空 = 自成一组；已有名字 = 加入；新名字 = 新建隐式组
+			std::string group_name = apply_settings_group;
+			if (group_name.empty())
+				group_name = apply_settings_rule.name;
+
+			int group_index = find_group_index(set.groups, group_name);
+			if (group_index < 0)
+			{
+				toggle_group group;
+				group.name = make_unique_group_name(set.groups, group_name);
+				group.active = true;
+				group.persistent = false;
+				set.groups.push_back(std::move(group));
+				group_index = static_cast<int>(set.groups.size()) - 1;
+			}
+
+			apply_settings_rule.group = static_cast<size_t>(group_index);
+			set.rules[apply_settings_index] = std::move(apply_settings_rule);
+
+			// 规则从旧组搬走之后，旧隐式组可能已经空了
+			prune_implicit_groups(set);
+
+			publish_rules(data, std::move(set));
 			data->has_unsaved_changes.store(true, std::memory_order_relaxed);
 			log_info("[Rules] settings applied");
 		}
@@ -5529,9 +6341,9 @@ static void draw_overlay(effect_runtime *runtime)
 
 	if (save_requested)
 	{
-		std::vector<texture_override_rule> rules_snapshot = copy_rules(acquire_rules(data));
+		rule_set set = copy_rule_set(acquire_rules(data));
 
-		if (save_config(std::move(rules_snapshot),
+		if (save_config(set,
 			data->hash_mode_value.load(std::memory_order_relaxed),
 			data->safe_mode.load(std::memory_order_relaxed),
 			data->candidate_columns.load(std::memory_order_relaxed)))
@@ -5546,8 +6358,26 @@ static void draw_overlay(effect_runtime *runtime)
 		data->settings_open = false;
 		data->settings_index = -1;
 		data->settings_error.clear();
-		data->edit_hotkey_capturing = false;
+		data->group_settings_open = false;
+		data->group_settings_index = -1;
+		data->group_settings_error.clear();
+		data->edit_group_hotkey_capturing = false;
 		data->capturing_hotkey.store(false, std::memory_order_relaxed);
+		data->pending_delete_group = -1;
+		selected_group = -1;
+		selected_group_name.clear();
+	}
+
+	// 选中的组：Numpad 3 / 面板的"新规则归属"都读它。
+	// 按名字重新解析成下标（本帧可能刚删组/改名/剪枝），找不到就当作没选。
+	{
+		const rule_table *table = acquire_rules(data);
+		int resolved = -1;
+		if (table != nullptr && !selected_group_name.empty())
+			resolved = find_group_index(table->groups, selected_group_name);
+
+		selected_group = resolved;
+		data->selected_group.store(resolved, std::memory_order_relaxed);
 	}
 
 	// 让 present 线程知道"现在键盘被 ImGui 占着"（用户在输入框里打字）。

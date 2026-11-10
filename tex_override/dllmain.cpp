@@ -2705,17 +2705,20 @@ static uint32_t resolve_descriptor_hash(device *dev, resource_view view)
 	// 2D 纹理才允许解析。挡的是“view 在 revalidate 之后、这里解析之前被销毁”
 	// 的窄窗——那时 get_resource_from_view 可能返回已释放的 ID3D11Resource*，
 	// 紧接着的 GetType/GetDesc 会直接把非法指针喂进驱动。
+	bool untracked = false;
 	{
 		std::lock_guard<std::mutex> lock(data->mutex);
-		if (data->live_textures.find(res.handle) == data->live_textures.end())
+		untracked = data->live_textures.find(res.handle) == data->live_textures.end();
+	}
+
+	if (untracked)
+	{
+		if (!g_logged_untracked_resource.exchange(true, std::memory_order_relaxed))
 		{
-			if (!g_logged_untracked_resource.exchange(true, std::memory_order_relaxed))
-			{
-				log_warn("[tex_override] descriptor hash skipped: resource not tracked "
-					"(created before injection?); texture-hash rules may miss it");
-			}
-			return 0;
+			log_warn("[tex_override] descriptor hash skipped: resource not tracked "
+				"(created before injection?); texture-hash rules may miss it");
 		}
+		return 0;
 	}
 
 	// 在读取任何内容之前先取一次墓碑环位置：
@@ -4447,25 +4450,29 @@ static void process_hotkeys(device_data *data)
 
 static void restart_candidate_collection(device_data *data)
 {
-	std::lock_guard<std::mutex> lock(data->mutex);
+	{
+		std::lock_guard<std::mutex> lock(data->mutex);
 
-	data->frame_candidates.clear();
-	data->collected_candidates.clear();
-	data->candidates.clear();
-	data->candidate_index = -1;
-	data->frames_collected.store(0, std::memory_order_relaxed);
-	data->collecting.store(true, std::memory_order_relaxed);
+		data->frame_candidates.clear();
+		data->collected_candidates.clear();
+		data->candidates.clear();
+		data->candidate_index = -1;
+		data->frames_collected.store(0, std::memory_order_relaxed);
+		data->collecting.store(true, std::memory_order_relaxed);
 
-	// 候选全部重建，旧的预览目标已不存在
-	clear_candidate_preview();
+		// 候选全部重建，旧的预览目标已不存在
+		clear_candidate_preview();
 
-	// 新纪元：先推进 epoch，再打开采集。各命令列表会在下一次 push/draw 时
-	// 丢弃挂机期间残留的陈旧 view 句柄，避免解引用已销毁的 SRV。
-	g_hunting_collect_epoch.fetch_add(1, std::memory_order_relaxed);
+		// 新纪元：先推进 epoch，再打开采集。各命令列表会在下一次 push/draw 时
+		// 丢弃挂机期间残留的陈旧 view 句柄，避免解引用已销毁的 SRV。
+		g_hunting_collect_epoch.fetch_add(1, std::memory_order_relaxed);
 
-	// 让 push_descriptors 开始记录 SRV 绑定（没有纹理规则时也需要）
-	g_hunting_collecting.store(true, std::memory_order_relaxed);
+		// 让 push_descriptors 开始记录 SRV 绑定（没有纹理规则时也需要）
+		g_hunting_collecting.store(true, std::memory_order_relaxed);
+	}
 
+	// 日志写在锁外：log_info 会拿 ReShade 自己的日志锁，
+	// 不要在持有 data->mutex 时引入跨模块的锁依赖。
 	log_info("[Hunting] candidate collection restarted");
 }
 
@@ -4553,6 +4560,26 @@ static void flush_command_counters(device_data *data)
 // -----------------------------------------------------------------------------
 static std::atomic<uint64_t> g_watchdog_last_tick{ 0 };
 static std::atomic<uint64_t> g_watchdog_start_tick{ 0 };
+
+// present 间隔探针：正常 16ms 一帧。出现 >2s 的间隔说明上一帧在某处被卡住过
+// （或进程被挂起）。只写一条日志，用于事后判断"UI 按不动"到底是 present 线程
+// 卡死，还是叠加层自己的输入问题。
+static std::atomic<uint64_t> g_last_present_tick{ 0 };
+
+static void log_present_gap()
+{
+	const uint64_t now = GetTickCount64();
+	const uint64_t last = g_last_present_tick.exchange(now, std::memory_order_relaxed);
+
+	if (last != 0 && now - last > 2000)
+	{
+		char message[160];
+		std::snprintf(message, sizeof(message),
+			"[Watch] present gap: %llu ms (previous frame stalled)",
+			static_cast<unsigned long long>(now - last));
+		log_info(message);
+	}
+}
 
 static void log_watchdog(device_data *data)
 {
@@ -4645,12 +4672,17 @@ static void on_present(
 	// 另外注意 t_key_down/t_key_pressed 是 thread_local：同一帧里多个 runtime
 	// 连续 present 时，第二次采样得到的是"无边沿"，不会重复触发。
 	log_watchdog(data);
+	log_present_gap();
 
 	const bool hunting = data->hunting.load(std::memory_order_relaxed);
 
 	// Hunting 关闭时清掉预览，避免"退出狩猎后画面还少一块"
 	if (!hunting)
 		clear_candidate_preview();
+
+	// 采集结束的日志放到锁外写（log 会拿 ReShade 的日志锁）
+	int finished_frames = 0;
+	size_t finished_candidates = 0;
 
 	{
 		std::lock_guard<std::mutex> lock(data->mutex);
@@ -4716,12 +4748,18 @@ static void on_present(
 			// 采集结束：push_descriptors 可以恢复极速早退
 			g_hunting_collecting.store(false, std::memory_order_relaxed);
 
-			char message[128];
-			std::snprintf(message, sizeof(message),
-				"[Hunting] paused after %d frame(s), %u candidate(s)",
-				collected_frames, static_cast<unsigned>(data->candidates.size()));
-			log_info(message);
+			finished_frames = collected_frames;
+			finished_candidates = data->candidates.size();
 		}
+	}
+
+	if (finished_frames != 0)
+	{
+		char message[128];
+		std::snprintf(message, sizeof(message),
+			"[Hunting] paused after %d frame(s), %u candidate(s)",
+			finished_frames, static_cast<unsigned>(finished_candidates));
+		log_info(message);
 	}
 }
 
@@ -4754,7 +4792,10 @@ static void draw_hud(device_data *data)
 	if (!data->hunting.load(std::memory_order_relaxed))
 		return;
 
-	const bool preview_enabled = data->preview_enabled.load(std::memory_order_relaxed);
+	// 实际正在预览的候选（g_preview.enabled），不是"预览开关"这个设置项。
+	// 重扫/退出狩猎会调用 clear_candidate_preview()，此时开关仍是开的，
+	// 但不能在 HUD 上继续宣称"candidate hidden"。
+	const bool preview_enabled = g_preview.enabled.load(std::memory_order_relaxed);
 
 	// 只取当前选中的那一条候选，避免整份拷贝
 	candidate selected;
@@ -4951,6 +4992,7 @@ static void draw_overlay(effect_runtime *runtime)
 		bool safe_mode = false;
 		bool preview_enabled = true;
 		bool has_unsaved = false;
+		bool preview_active = false;
 		uint32_t preview_skipped = 0;
 		uint32_t resolved = 0;
 		uint32_t applied = 0;
@@ -4983,6 +5025,7 @@ static void draw_overlay(effect_runtime *runtime)
 		snapshot.stable_only = data->stable_only_rules.load(std::memory_order_relaxed);
 		snapshot.safe_mode = data->safe_mode.load(std::memory_order_relaxed);
 		snapshot.preview_enabled = data->preview_enabled.load(std::memory_order_relaxed);
+		snapshot.preview_active = g_preview.enabled.load(std::memory_order_relaxed);
 		snapshot.has_unsaved = data->has_unsaved_changes.load(std::memory_order_relaxed);
 		snapshot.preview_skipped = data->preview_skipped.load(std::memory_order_relaxed);
 		snapshot.resolved = data->srv_resolved.load(std::memory_order_relaxed);
@@ -5036,6 +5079,9 @@ static void draw_overlay(effect_runtime *runtime)
 	int group_active_index = -1;
 	bool group_active_value = true;
 	int group_remove_index = -1;
+	// 组的 X：需要二次确认的组下标。弹窗必须在**表格外**、且与 BeginPopupModal
+	// 同一 ID 栈里 OpenPopup（表格里 PushID 会改变 popup 的 ID）。
+	int confirm_group_delete = -1;
 	bool new_group_requested = false;
 	int open_group_settings_index = -1;
 	bool apply_group_settings = false;
@@ -5276,8 +5322,8 @@ static void draw_overlay(effect_runtime *runtime)
 			{
 				const candidate &entry = snapshot.candidates[i];
 				const bool is_selected = (i == view_index);
-				// 选中 + 预览开启 = 当前正被临时隐藏（与 HUD 的 PREVIEW 徽标一致）
-				const bool is_hidden = is_selected && snapshot.preview_enabled;
+				// 选中 + **确实在预览** = 当前正被临时隐藏（与 HUD 的 PREVIEW 徽标一致）
+				const bool is_hidden = is_selected && snapshot.preview_active;
 
 				ImGui::PushID(i);
 
@@ -5435,11 +5481,19 @@ static void draw_overlay(effect_runtime *runtime)
 
 					ImGui::TableSetColumnIndex(4);
 					{
-						char label[192];
+						char label[224];
 						std::snprintf(label, sizeof(label), "%s  (%d rule%s)",
 							group.name.empty() ? "<unnamed>" : group.name.c_str(),
 							rule_count,
 							rule_count == 1 ? "" : "s");
+
+						// 展开状态用稳定的 storage id（组序号），而不是标题：
+						// 标题里的规则数会随增删变化，若让它决定 ID，每加一条规则
+						// 展开状态就丢一次。另外这里**不能**用 TreeNodeEx 的
+						// ptr_id + fmt 变参重载——那个重载在 SDK 头里 return 之后
+						// 还有 va_end，/W4 会报 C4702（头文件的锅，绕开）。
+						ImGui::SetNextItemStorageID(
+							ImGui::GetID(reinterpret_cast<const void *>(static_cast<intptr_t>(g) + 1)));
 
 						const bool group_open = ImGui::TreeNodeEx(label,
 							ImGuiTreeNodeFlags_SpanAvailWidth |
@@ -5461,7 +5515,39 @@ static void draw_overlay(effect_runtime *runtime)
 						if (ImGui::IsItemHovered())
 							ImGui::SetTooltip("%s", group.name.c_str());
 
-						// 展开：逐条列出组内规则，Edit / X 与上面的按钮列对齐
+						// 注意顺序：先把**本行**的五、六列提交完，再画子行。
+						// （先画子行再回头 TableSetColumnIndex(5/6) 会把 Key/X
+						//   塞进最后一条子行的行里，按钮位置随之错乱。）
+						ImGui::TableSetColumnIndex(5);
+						{
+							// 右对齐：用列宽算偏移（GetContentRegionAvail 在表格单元里是窗口级，
+							// 会算到列外去，所以这里必须用 GetColumnWidth）
+							const std::string key_text = group.hotkey != 0
+								? hotkey_to_string(group.hotkey)
+								: std::string("[No Key]");
+
+							const float text_width = ImGui::CalcTextSize(key_text.c_str()).x;
+							const float offset = ImGui::GetColumnWidth() - text_width - ImGui::GetStyle().CellPadding.x;
+							if (offset > 0.0f)
+								ImGui::SetCursorPosX(ImGui::GetCursorPosX() + offset);
+
+							if (group.hotkey != 0)
+								ImGui::TextUnformatted(key_text.c_str());
+							else
+								ImGui::TextDisabled("%s", key_text.c_str());
+						}
+
+						ImGui::TableSetColumnIndex(6);
+						if (ImGui::Button("X"))
+						{
+							if (rule_count != 0)
+								confirm_group_delete = g;   // 弹窗放到表格外再开（见下）
+							else
+								group_remove_index = g;
+						}
+						if (ImGui::IsItemHovered())
+							ImGui::SetTooltip("Delete this group and all of its rules");
+
 						if (group_open)
 						{
 							for (int r = 0; r < static_cast<int>(snapshot.rules.size()); ++r)
@@ -5518,48 +5604,34 @@ static void draw_overlay(effect_runtime *runtime)
 						}
 					}
 
-					ImGui::TableSetColumnIndex(5);
-					{
-						// 右对齐：用列宽算偏移（GetContentRegionAvail 在表格单元里是窗口级，
-						// 会算到列外去，所以这里必须用 GetColumnWidth）
-						const std::string key_text = group.hotkey != 0
-							? hotkey_to_string(group.hotkey)
-							: std::string("[No Key]");
-
-						const float text_width = ImGui::CalcTextSize(key_text.c_str()).x;
-						const float offset = ImGui::GetColumnWidth() - text_width - ImGui::GetStyle().CellPadding.x;
-						if (offset > 0.0f)
-							ImGui::SetCursorPosX(ImGui::GetCursorPosX() + offset);
-
-						if (group.hotkey != 0)
-							ImGui::TextUnformatted(key_text.c_str());
-						else
-							ImGui::TextDisabled("%s", key_text.c_str());
-					}
-
-					ImGui::TableSetColumnIndex(6);
-					if (ImGui::Button("X"))
-					{
-						if (rule_count != 0)
-						{
-							data->pending_delete_group = g;
-							ImGui::OpenPopup("delete_group_confirm");
-						}
-						else
-						{
-							group_remove_index = g;
-						}
-					}
-					if (ImGui::IsItemHovered())
-						ImGui::SetTooltip("Delete this group and all of its rules");
-
 					ImGui::PopID();
 				}
 
 				ImGui::EndTable();
 			}
 
-			// 组删除确认：组里还有规则时必须过一道，避免一次误触清掉整组
+			if (snapshot.groups.empty())
+				ImGui::TextDisabled("No groups yet.");
+
+			ImGui::EndChild();
+
+			// New 放在列表**下面**：先建空组、再选中它去狩猎攒规则
+			if (ImGui::Button("+ New group"))
+				new_group_requested = true;
+			if (ImGui::IsItemHovered())
+				ImGui::SetTooltip("Create an empty group, select it, then add rules with Numpad 3");
+
+			// 组删除确认：组里还有规则时必须过一道，避免一次误触清掉整组。
+			// OpenPopup 与 BeginPopupModal 必须在**同一个 ID 栈**、且在子窗口
+			// 之外：之前 OpenPopup 写在表格的 PushID 里，ID 对不上，弹窗永远
+			// 打不开（组的 X 看起来"按不动"）；而把模态画在可滚动的子窗口里，
+			// 它有可能被裁到看不见却仍然吃掉所有点击。
+			if (confirm_group_delete >= 0)
+			{
+				data->pending_delete_group = confirm_group_delete;
+				ImGui::OpenPopup("delete_group_confirm");
+			}
+
 			if (ImGui::BeginPopupModal("delete_group_confirm", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
 			{
 				const int pending = data->pending_delete_group;
@@ -5598,17 +5670,6 @@ static void draw_overlay(effect_runtime *runtime)
 
 				ImGui::EndPopup();
 			}
-
-			if (snapshot.groups.empty())
-				ImGui::TextDisabled("No groups yet.");
-
-			ImGui::EndChild();
-
-			// New 放在列表**下面**：先建空组、再选中它去狩猎攒规则
-			if (ImGui::Button("+ New group"))
-				new_group_requested = true;
-			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("Create an empty group, select it, then add rules with Numpad 3");
 		}
 
 		ImGui::Separator();

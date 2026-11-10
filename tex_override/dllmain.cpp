@@ -833,6 +833,22 @@ struct __declspec(uuid("d4e6f8a0-1b3c-4d5e-9f70-2a4c6e8b0d13")) cmd_list_data
 	uint64_t views_validated_seq = 0;
 };
 
+// -----------------------------------------------------------------------------
+// 候选列表的显示列（位掩码）
+//
+// 纯 UI 状态：只决定列表里画哪些字段，不参与任何匹配判定。
+// 位序固定为 tex / ps / vs / fi / ic，默认全开（"默认全部显示"）。
+// -----------------------------------------------------------------------------
+enum : uint32_t
+{
+	candidate_col_tex = 1u << 0,
+	candidate_col_ps = 1u << 1,
+	candidate_col_vs = 1u << 2,
+	candidate_col_fi = 1u << 3,
+	candidate_col_ic = 1u << 4,
+	candidate_col_all = 0x1Fu
+};
+
 struct __declspec(uuid("6b0f4d2a-3c1e-4a7b-9f2d-1e5c8a9b0d31")) device_data
 {
 	// 是否运行在 D3D11 上。非 D3D11 时禁止把 ReShade 句柄强转成原生 D3D 指针。
@@ -893,6 +909,9 @@ struct __declspec(uuid("6b0f4d2a-3c1e-4a7b-9f2d-1e5c8a9b0d31")) device_data
 	// 候选预览（只影响渲染，不影响规则表）：勾掉后立刻取消隐藏
 	std::atomic<bool> preview_enabled{ true };
 	std::atomic<uint32_t> preview_skipped{ 0 };
+
+	// 候选列表显示的列（candidate_col_*，默认全开）。纯 UI 状态。
+	std::atomic<uint32_t> candidate_columns{ candidate_col_all };
 
 	// Group settings 窗口状态（仅 overlay 线程访问）
 	bool settings_open = false;
@@ -1504,6 +1523,73 @@ static std::string lower_copy(std::string text)
 	return text;
 }
 
+// 候选列表显示列（candidate_col_*）↔ INI 文本。
+// 写成可读的名字列表（"tex ps vs fi ic"），手写 INI 时也能看懂。
+static std::string candidate_columns_to_string(uint32_t mask)
+{
+	static const char *const names[] = { "tex", "ps", "vs", "fi", "ic" };
+
+	std::string text;
+	for (int i = 0; i < 5; ++i)
+	{
+		if ((mask & (1u << i)) == 0)
+			continue;
+		if (!text.empty())
+			text += ' ';
+		text += names[i];
+	}
+	return text;
+}
+
+static bool parse_candidate_columns(const std::string &text, uint32_t &out)
+{
+	const std::string lowered = trim_copy(lower_copy(text));
+
+	// 空值 / all / * = 全部显示；none = 全部隐藏（列表仍可点选）
+	if (lowered.empty() || lowered == "all" || lowered == "*")
+	{
+		out = candidate_col_all;
+		return true;
+	}
+	if (lowered == "none")
+	{
+		out = 0;
+		return true;
+	}
+
+	uint32_t mask = 0;
+	size_t begin = 0;
+	while (begin < lowered.size())
+	{
+		const size_t end = lowered.find_first_of(" ,\t", begin);
+		const std::string token = lowered.substr(begin,
+			end == std::string::npos ? std::string::npos : end - begin);
+
+		if (!token.empty())
+		{
+			if (token == "tex" || token == "hash" || token == "texture")
+				mask |= candidate_col_tex;
+			else if (token == "ps")
+				mask |= candidate_col_ps;
+			else if (token == "vs")
+				mask |= candidate_col_vs;
+			else if (token == "fi" || token == "first_index")
+				mask |= candidate_col_fi;
+			else if (token == "ic" || token == "count" || token == "index_count")
+				mask |= candidate_col_ic;
+			else
+				return false; // 未知列名：整行无效，保留调用方的旧值
+		}
+
+		if (end == std::string::npos)
+			break;
+		begin = end + 1;
+	}
+
+	out = mask;
+	return true;
+}
+
 // -----------------------------------------------------------------------------
 // 规则表：写时整体替换，读侧无锁
 //
@@ -1703,6 +1789,7 @@ static void load_config(device_data *data)
 		log_info("[Config] TextureOverride.ini not found; 0 rules");
 		// 没有配置文件时必须回到默认模式，否则“删掉 INI 再 Reload”会沿用旧模式
 		data->hash_mode_value.store(static_cast<int>(hash_mode::descriptor), std::memory_order_relaxed);
+		data->candidate_columns.store(candidate_col_all, std::memory_order_relaxed);
 		publish_rules(data, {});
 		data->has_unsaved_changes.store(false, std::memory_order_relaxed);
 		return;
@@ -1719,6 +1806,7 @@ static void load_config(device_data *data)
 	size_t line_number = 0;
 	int parsed_hash_mode = -1;
 	int parsed_safe_mode = -1;
+	uint32_t parsed_candidate_columns = UINT32_MAX; // UINT32_MAX = INI 里没写
 
 	texture_override_rule current;
 	bool current_valid = true;
@@ -1881,6 +1969,14 @@ static void load_config(device_data *data)
 				if (parse_u32(value, flag))
 					parsed_safe_mode = (flag != 0);
 			}
+			else if (key == "candidate_columns")
+			{
+				uint32_t mask = 0;
+				if (parse_candidate_columns(value, mask))
+					parsed_candidate_columns = mask;
+				else
+					log_warn("[Config] candidate_columns: unknown column name; keeping the default (all)");
+			}
 			continue;
 		}
 
@@ -2016,6 +2112,9 @@ static void load_config(device_data *data)
 
 	flush();
 
+	if (parsed_candidate_columns != UINT32_MAX)
+		data->candidate_columns.store(parsed_candidate_columns, std::memory_order_relaxed);
+
 	if (parsed_hash_mode >= 0)
 		data->hash_mode_value.store(parsed_hash_mode, std::memory_order_relaxed);
 
@@ -2052,7 +2151,8 @@ static void load_config(device_data *data)
 // -----------------------------------------------------------------------------
 // INI 保存
 // -----------------------------------------------------------------------------
-static bool save_config(std::vector<texture_override_rule> rules, int hash_mode_value, bool safe_mode)
+static bool save_config(std::vector<texture_override_rule> rules, int hash_mode_value, bool safe_mode,
+	uint32_t candidate_columns)
 {
 	const std::filesystem::path path = get_config_path();
 	std::filesystem::path temp = path;
@@ -2076,7 +2176,9 @@ static bool save_config(std::vector<texture_override_rule> rules, int hash_mode_
 		file << "hash_mode = "
 			<< (hash_mode_value == static_cast<int>(hash_mode::pixel) ? "pixel" : "descriptor")
 			<< "\n";
-		file << "safe_mode = " << (safe_mode ? 1 : 0) << "\n\n";
+		file << "safe_mode = " << (safe_mode ? 1 : 0) << "\n";
+		file << "; candidate_columns: which fields the candidate list shows (tex ps vs fi ic)\n";
+		file << "candidate_columns = " << candidate_columns_to_string(candidate_columns) << "\n\n";
 
 		for (size_t i = 0; i < rules.size(); ++i)
 		{
@@ -4233,13 +4335,17 @@ static void draw_hud(device_data *data)
 	// 只取当前选中的那一条候选，避免整份拷贝
 	candidate selected;
 	bool has_candidate = false;
+	int candidate_position = -1;   // 0-based
+	int candidate_count = 0;
 
 	{
 		std::lock_guard<std::mutex> lock(data->mutex);
+		candidate_count = static_cast<int>(data->candidates.size());
 		if (data->candidate_index >= 0 &&
-			data->candidate_index < static_cast<int>(data->candidates.size()))
+			data->candidate_index < candidate_count)
 		{
 			selected = data->candidates[data->candidate_index];
+			candidate_position = data->candidate_index;
 			has_candidate = true;
 		}
 	}
@@ -4262,6 +4368,18 @@ static void draw_hud(device_data *data)
 	const ImU32 col_dim = IM_COL32(170, 170, 170, 255);
 
 	push_line("Hunting Mode: ON", col_accent);
+
+	// 列表进度：当前第几条 / 共几条。狩猎时最常见的疑问就是"我现在翻到哪了"。
+	{
+		char buffer[160];
+		if (candidate_count > 0)
+			std::snprintf(buffer, sizeof(buffer), "Candidate %d / %d (%.0f%%)",
+				candidate_position + 1, candidate_count,
+				100.0 * static_cast<double>(candidate_position + 1) / static_cast<double>(candidate_count));
+		else
+			std::snprintf(buffer, sizeof(buffer), "Candidate 0 / 0");
+		push_line(buffer, col_normal);
+	}
 
 	if (has_candidate)
 	{
@@ -4517,12 +4635,6 @@ static void draw_overlay(effect_runtime *runtime)
 	ImGui::SetWindowSize(main_window_size, ImGuiCond_FirstUseEver);
 
 	{
-		if (snapshot.has_unsaved)
-		{
-			// 标题由 ReShade 控制、改不了，未保存标记放在内容顶部
-			ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.2f, 1.0f), "* Unsaved changes");
-		}
-
 		ImGui::Text("Draws: %u   Skipped: %u   Rules applied: %u",
 			snapshot.draws, snapshot.skipped, snapshot.applied);
 		ImGui::Text("Cache hit: %llu / %llu (%.1f%%)   Active SRV Cache: %d",
@@ -4662,7 +4774,51 @@ static void draw_overlay(effect_runtime *runtime)
 		}
 
 		ImGui::Text("Candidates: %d", candidate_count);
-		if (ImGui::BeginChild("##candidates", ImVec2(0.0f, 130.0f), true))
+
+		// 显示列开关（默认全开）。只影响列表渲染；勾选结果随 Save to INI 写进 [Settings]。
+		uint32_t visible_columns = data->candidate_columns.load(std::memory_order_relaxed);
+		{
+			static const char *const column_names[] = { "tex", "ps", "vs", "fi", "ic" };
+
+			bool columns_changed = false;
+			ImGui::TextDisabled("Show:");
+			for (int column = 0; column < 5; ++column)
+			{
+				ImGui::SameLine();
+				bool enabled = (visible_columns & (1u << column)) != 0;
+				if (ImGui::Checkbox(column_names[column], &enabled))
+				{
+					if (enabled)
+						visible_columns |= (1u << column);
+					else
+						visible_columns &= ~(1u << column);
+					columns_changed = true;
+				}
+			}
+
+			ImGui::SameLine();
+			if (ImGui::SmallButton("all"))
+			{
+				visible_columns = candidate_col_all;
+				columns_changed = true;
+			}
+
+			if (columns_changed)
+			{
+				data->candidate_columns.store(visible_columns, std::memory_order_relaxed);
+				data->has_unsaved_changes.store(true, std::memory_order_relaxed);
+				snapshot.has_unsaved = true;
+			}
+		}
+
+		const bool show_tex = (visible_columns & candidate_col_tex) != 0;
+		const bool show_ps = (visible_columns & candidate_col_ps) != 0;
+		const bool show_vs = (visible_columns & candidate_col_vs) != 0;
+		const bool show_fi = (visible_columns & candidate_col_fi) != 0;
+		const bool show_ic = (visible_columns & candidate_col_ic) != 0;
+		const bool show_any = show_tex || show_ps || show_vs || show_fi || show_ic;
+
+		if (ImGui::BeginChild("##candidates", ImVec2(0.0f, 130.0f), true, ImGuiWindowFlags_HorizontalScrollbar))
 		{
 			for (int i = 0; i < candidate_count; ++i)
 			{
@@ -4673,16 +4829,46 @@ static void draw_overlay(effect_runtime *runtime)
 
 				ImGui::PushID(i);
 
-				// 行内只保留定位必需的信息，ps/vs 挪到 tooltip，避免列表被撑宽
-				char label[96];
-				std::snprintf(label, sizeof(label), "%s0x%08X  fi=%u ic=%u",
-					is_hidden ? "[Hidden] " : (is_selected ? "> " : "  "),
-					entry.hash, entry.first_index, entry.index_count);
+				// 行内容按用户勾选的列拼装；ps/vs 缺省也在 tooltip 里，避免列表被撑宽
+				std::string label = is_hidden ? "[Hidden] " : (is_selected ? "> " : "  ");
+				if (!show_any)
+				{
+					label += "(no columns enabled)";
+				}
+				else
+				{
+					char part[64];
+					if (show_tex)
+					{
+						std::snprintf(part, sizeof(part), "tex=0x%08X  ", entry.hash);
+						label += part;
+					}
+					if (show_ps)
+					{
+						std::snprintf(part, sizeof(part), "ps=0x%08X  ", entry.ps_hash);
+						label += part;
+					}
+					if (show_vs)
+					{
+						std::snprintf(part, sizeof(part), "vs=0x%08X  ", entry.vs_hash);
+						label += part;
+					}
+					if (show_fi)
+					{
+						std::snprintf(part, sizeof(part), "fi=%u  ", entry.first_index);
+						label += part;
+					}
+					if (show_ic)
+					{
+						std::snprintf(part, sizeof(part), "ic=%u", entry.index_count);
+						label += part;
+					}
+				}
 
 				if (is_hidden)
 					ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.3f, 1.0f));
 
-				if (ImGui::Selectable(label, is_selected))
+				if (ImGui::Selectable(label.c_str(), is_selected))
 					select_local(i);
 
 				if (is_hidden)
@@ -4822,11 +5008,14 @@ static void draw_overlay(effect_runtime *runtime)
 
 		ImGui::Separator();
 
-		// Debug: rule details —— 默认折叠；只读展示，操作统一在 Toggle Groups 里，
-		// 因此不再重复提供 Act / Set / Del，FI 与 IC 合成一列以免横向溢出。
-		if (ImGui::CollapsingHeader("Debug: rule details"))
+		// 哈希管理 —— 规则的"总账"：每条规则的哈希/区间/热键/模式一目了然，
+		// 并且把编辑与删除都放在这一张表里（不再要求先去 Toggle Groups 找）。
+		// FI / IC 合成一列、热键只在有绑定时显示，都是为了窄面板下不横向溢出。
+		if (ImGui::CollapsingHeader("Hash management", ImGuiTreeNodeFlags_DefaultOpen))
 		{
-			if (ImGui::BeginTable("##rules", 6,
+			ImGui::TextDisabled("Every rule with its hash conditions; edit or delete it right here.");
+
+			if (ImGui::BeginTable("##rules", 8,
 				ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
 			{
 				ImGui::TableSetupColumn("Tex");
@@ -4835,6 +5024,8 @@ static void draw_overlay(effect_runtime *runtime)
 				ImGui::TableSetupColumn("FI / IC");
 				ImGui::TableSetupColumn("Key");
 				ImGui::TableSetupColumn("Mode");
+				ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 44.0f); // Edit
+				ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 26.0f); // X
 				ImGui::TableHeadersRow();
 
 				for (int i = 0; i < static_cast<int>(snapshot.rules.size()); ++i)
@@ -4851,6 +5042,11 @@ static void draw_overlay(effect_runtime *runtime)
 						ImGui::TextUnformatted("*");
 					else
 						ImGui::Text("0x%08X", rule.hash);
+					if (!rule.active)
+					{
+						ImGui::SameLine();
+						ImGui::TextDisabled("(off)");
+					}
 
 					ImGui::TableSetColumnIndex(1);
 					if (rule.ps_hash != 0)
@@ -4878,15 +5074,27 @@ static void draw_overlay(effect_runtime *runtime)
 					ImGui::TableSetColumnIndex(5);
 					ImGui::TextUnformatted(rule.handling == handling_mode::skip ? "skip" : "replace");
 
+					ImGui::TableSetColumnIndex(6);
+					if (ImGui::Button("Edit"))
+						open_settings_index = i;
+					if (ImGui::IsItemHovered())
+						ImGui::SetTooltip("Edit this rule");
+
+					ImGui::TableSetColumnIndex(7);
+					if (ImGui::Button("X"))
+						remove_index = i;
+					if (ImGui::IsItemHovered())
+						ImGui::SetTooltip("Delete this rule");
+
 					ImGui::PopID();
 				}
 
 				ImGui::EndTable();
 			}
-		}
 
-		if (snapshot.rules.empty())
-			ImGui::TextDisabled("No rules. Use Hunting Mode or edit TextureOverride.ini.");
+			if (snapshot.rules.empty())
+				ImGui::TextDisabled("No rules yet. Enable Hunting Mode and press Numpad 3 on a candidate.");
+		}
 
 		ImGui::Separator();
 
@@ -4900,6 +5108,14 @@ static void draw_overlay(effect_runtime *runtime)
 				ImGui::OpenPopup("reload_confirm");
 			else
 				reload_requested = true;
+		}
+
+		// 未保存标记紧跟在两个按钮下面：它就是这两个按钮的"状态说明"，
+		// 放在窗口顶部离按钮太远，按钮下面更容易被看到（也不需要标题栏）。
+		if (snapshot.has_unsaved)
+		{
+			ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.2f, 1.0f),
+				"* Unsaved changes - press Save to INI to write them to disk.");
 		}
 
 		if (ImGui::BeginPopupModal("reload_confirm", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
@@ -5317,7 +5533,8 @@ static void draw_overlay(effect_runtime *runtime)
 
 		if (save_config(std::move(rules_snapshot),
 			data->hash_mode_value.load(std::memory_order_relaxed),
-			data->safe_mode.load(std::memory_order_relaxed)))
+			data->safe_mode.load(std::memory_order_relaxed),
+			data->candidate_columns.load(std::memory_order_relaxed)))
 			data->has_unsaved_changes.store(false, std::memory_order_relaxed);
 	}
 

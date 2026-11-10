@@ -13,6 +13,7 @@
 [Settings]
 hash_mode = descriptor   ; descriptor（快） | pixel（精确，仅 CPU 上传的纹理）
 safe_mode = 0            ; 1 = 安全模式：禁用 replace 与像素哈希（排查系统重启用）
+candidate_columns = tex ps vs fi ic   ; 候选列表显示哪些列；all = 全开（默认），none = 全关
 
 ; 只写稳定锚点：跨进程重启依然有效（动态图集不会影响结果）
 [TextureOverrideNameCard]
@@ -177,14 +178,16 @@ tex_override\bin\x64\Release\tex_override.addon64
 - Hunting 控制区：`Hunting Mode` 勾选、`Frames to collect` 滑块（1–120）、`Refresh`。
 - `Stable-only new rules (hash = *)`：勾选时 Numpad 3 生成不依赖纹理哈希的规则（默认开启）。
 - `Pixel hashes: N texture(s), X MB hashed`：像素哈希采集情况；为 0 时会提示原因。
-- 候选列表：进入 Hunting 后累积 `Frames to collect` 帧的候选并集，随后**冻结**。行内只显示 `纹理哈希 + fi/ic`，`ps/vs` 收进悬停 Tooltip；当前选中且预览开启的行用黄色 `[Hidden]` 前缀标记（与 HUD 的 `PREVIEW` 徽标对应）。
+- 候选列表：进入 Hunting 后累积 `Frames to collect` 帧的候选并集，随后**冻结**。行内默认显示 `tex / ps / vs / fi / ic` 全部五列，可用列表上方的 `Show: tex ps vs fi ic` 逐个开关、`all` 一键全开（**默认全开**，选择会随 `Save to INI` 写进 `[Settings] candidate_columns`）；当前选中且预览开启的行用黄色 `[Hidden]` 前缀标记（与 HUD 的 `PREVIEW` 徽标对应）。
+  - 任何列都关掉时行内显示 `(no columns enabled)`，仍可点选；悬停 Tooltip 永远显示完整字段。
   - **点选即预览**：点某一行（或用 Numpad 1/2 步进）会立刻把该候选对应的绘制**隐藏**，用"元素消失"确认它是哪一块画面，再按 Numpad 3 落规则。开关是候选列表上方的 `Preview selected (hide it live)`（默认开）；旁边的 `preview hidden: N draw(s)` 是预览跳过的绘制数（不计入 `Skipped`）。
 - `List of Toggle Groups`（表格布局，默认展开）：列依次是 `# | Act | Edit | Hunt | Group | Key | X`。
   - `X` 放在**最右**，避免紧挨着 `Edit` 误触；`Hunt` 只开启 Hunting，**不会**重启采集清空候选列表。
   - `Key` 列右对齐；没有绑定时显示暗灰 `[No Key]`。
   - 组名来自 INI 的 `name =`（`Save to INI` 会写回），没名字时显示 `<unnamed>`，被禁用的组会追加 `(disabled)`。
-- `Debug: rule details`（默认**折叠**）：只读的原始哈希表 `Tex / PS / VS / FI / IC / Key / Mode`（FI 与 IC 合并为一列以免横向溢出）。增删改统一走上面的 Toggle Groups，这里不再重复提供按钮。
-- 底部：`Save to INI` / `Reload from INI`；存在未保存修改时**面板顶部显示黄色 `* Unsaved changes`**，且点 `Reload from INI` 会弹二次确认（`Reload` / `Cancel`）。
+- `Hash management`（默认展开）：所有规则的"总账"，列为 `Tex / PS / VS / FI / IC / Key / Mode / Edit / X`（FI 与 IC 合并为一列以免横向溢出）。
+  - `Edit` 打开该规则的设置窗口，`X` 直接删掉该规则——**改与删都在这一张表里完成**，不必先去 Toggle Groups 找对应行。
+- 底部：`Save to INI` / `Reload from INI`；存在未保存修改时，**在这两个按钮下方**显示黄色 `* Unsaved changes`（它俩的状态说明），点 `Reload from INI` 会弹二次确认（`Reload` / `Cancel`）。
 - 窗口默认尺寸会随分辨率收缩（屏幕高 < 600 或宽 < 800 时按 0.8 缩放）。
 
 > **实现约束：不要在自己的 `register_overlay` 回调里再 `ImGui::Begin` 一次。** ReShade 已经用注册时给的标题开好了窗口（`if (ImGui::Begin(widget.title...)) widget.callback(this); ImGui::End();`），再 Begin 会多出一个同名窗口；如果为了在标题上加标记而把标题写成 `xxx###id`，ID 变了就会真的出现两个窗口。所以未保存标记只能画在内容里（ReShade 的窗口标题改不了）。
@@ -195,7 +198,7 @@ tex_override\bin\x64\Release\tex_override.addon64
 >
 > **优先级**：通配符规则（`hash = *`）命中即**立即返回**，优先级绝对高于任何带纹理哈希的规则——即使后者的 `match_priority` 更高。若需要两者共存，请把纹理规则也改成通配符形式（用 `match_ps_hash` + 几何条件区分）。
 
-HUD：Hunting 开启时**用 ImGui 前景绘制列表直接画在屏幕坐标上**（不是 ImGui 窗口），并且由 `addon_event::reshade_overlay` 驱动 —— **关掉 ReShade 面板（Home）后依然常驻**（与 ShaderToggler 的 `ShaderTogglerInfo` 同一机制）。内容为 `Hunting Mode: ON` / `PREVIEW: candidate hidden`（预览开启且已选中候选时）/ 当前候选的 tex、ps、vs、fi、ic / 两行 Numpad 提示。按住左键直接拖拽即可移动，位置与透明度也可在面板 `HUD overlay` 里用 `HUD X / HUD Y / HUD Alpha` 调整；位置会被钳在屏幕内。
+HUD：Hunting 开启时**用 ImGui 前景绘制列表直接画在屏幕坐标上**（不是 ImGui 窗口），并且由 `addon_event::reshade_overlay` 驱动 —— **关掉 ReShade 面板（Home）后依然常驻**（与 ShaderToggler 的 `ShaderTogglerInfo` 同一机制）。内容为 `Hunting Mode: ON` / `Candidate 22 / 100 (22%)`（当前第几条 / 候选总数，狩猎时最常问的"我翻到哪了"）/ `PREVIEW: candidate hidden`（预览开启且已选中候选时）/ 当前候选的 tex、ps、vs、fi、ic / 两行 Numpad 提示。按住左键直接拖拽即可移动，位置与透明度也可在面板 `HUD overlay` 里用 `HUD X / HUD Y / HUD Alpha` 调整；位置会被钳在屏幕内。
 
 ### 3.4 热键
 

@@ -192,7 +192,7 @@ tex_override\bin\x64\Release\tex_override.addon64
 >
 > **优先级**：通配符规则（`hash = *`）命中即**立即返回**，优先级绝对高于任何带纹理哈希的规则——即使后者的 `match_priority` 更高。若需要两者共存，请把纹理规则也改成通配符形式（用 `match_ps_hash` + 几何条件区分）。
 
-HUD：Hunting 开启时**用 ImGui 前景绘制列表画在屏幕坐标上**（不是一个 ImGui 窗口），因此永远在最上层、不会被停靠进 ReShade 面板，也不会被面板遮住。内容为 `Hunting Mode: ON` / `PREVIEW: candidate hidden`（预览开启且已选中候选时）/ 当前候选的 tex、ps、vs、fi、ic / 两行 Numpad 提示。按住左键直接拖拽即可移动，位置与透明度也可在面板 `HUD overlay` 里用 `HUD X / HUD Y / HUD Alpha` 调整；位置会被钳在屏幕内，拖出边界也能找回来。
+HUD：Hunting 开启时**用 ImGui 前景绘制列表直接画在屏幕坐标上**（不是 ImGui 窗口），并且由 `addon_event::reshade_overlay` 驱动 —— **关掉 ReShade 面板（Home）后依然常驻**（与 ShaderToggler 的 `ShaderTogglerInfo` 同一机制）。内容为 `Hunting Mode: ON` / `PREVIEW: candidate hidden`（预览开启且已选中候选时）/ 当前候选的 tex、ps、vs、fi、ic / 两行 Numpad 提示。按住左键直接拖拽即可移动，位置与透明度也可在面板 `HUD overlay` 里用 `HUD X / HUD Y / HUD Alpha` 调整；位置会被钳在屏幕内。
 
 ### 3.4 热键
 
@@ -240,7 +240,7 @@ Hunting Mode 关闭时数字键完全无效。Hunting 关闭且规则为空、�
 - **候选预览**：hunting 时"点选/步进候选 → 立刻隐藏对应绘制"，用元素消失确认选中项（等价于 ShaderToggler/REST 的"步进即隐藏"）。实现是一个 32 位 seqlock（`candidate_preview`：hash / ps / vs / enabled + 序号），overlay 与 present 线程写、draw 线程读，读到写一半就放弃本帧预览，绝不做错匹配。匹配时先用 PS/VS 两个字段做廉价预筛（绝大多数 draw 一次比较就退出），命中同 shader 才遍历绑定 SRV，并复用慢速通道的 `bound_entry` / 线程局部哈希缓存，不额外产生 `GetDesc`。语义上等于"这条候选覆盖的所有绘制"，因此同一纹理+同一 shader 的多个 draw 会一起隐藏；预览与规则表完全解耦（没有合成规则、不写 INI），退出 Hunting 或清空候选时自动解除。它要求绑定表处于当前狩猎纪元（否则句柄可能悬垂），并且**优先于规则判定**——预览期间被隐藏的绘制不会再走规则匹配。
 - **键盘边沿与规则热键**：`poll_key_edges()` 每帧只采样一次整张 256 键表（`t_key_down` / `t_key_pressed`），Hunting 键与规则热键共用同一份快照——早期"每个键各自 `GetAsyncKeyState` 边沿"会让同一个键被两处查询时互相吞键。热键判定是"主键按下沿 + 修饰键严格相等"，修饰键同时检查 generic 与 L/R 两个 VK 码。
 - **热键捕获**：捕获与热键判定都读 **`effect_runtime` 的按键状态**（`is_key_down` / 由它派生的边沿），在 `addon_event::reshade_present` 里处理——与 ShaderToggler 的 `KeyData` 同一套数据源。**不能用 `GetAsyncKeyState`**：ReShade 用 inline hook 包了它，当面板打开且 `imgui_io.WantCaptureKeyboard` 为真时（点 `Capture shortcut` 之后正好是这个状态）`HookGetAsyncKeyState` 对所有键盘键返回 0，第三方 addon 调到的也是这个被 hook 的函数——这正是"点捕获后按任何键都没反应"的根因。流程：overlay 只置 `capturing_hotkey`，present 线程命中后写 `captured_hotkey` + `hotkey_capture_seq`，overlay 下一帧取值显示；跳过鼠标 1–6 与修饰键本身，`Esc` 取消、`Backspace` 清除，成功/取消都写日志，捕获期间每 3 秒还会打印一行 `[Hotkey] waiting for a key... (runtime sees N key(s) down)` 便于排查。`Group settings` 的字段区放在可滚动子窗口里，窗口被缩小或行数变多时热键行不会掉到看不见的位置。
-- **HUD 用前景绘制列表**：Hunting 提示不是 ImGui 窗口，而是 `ImGui::GetForegroundDrawList()` 上按屏幕坐标画的矩形 + 文本。用窗口时会被停靠/排到面板后面（用户看到的就是"跑进 ReShade 面板里"）；绘制列表永远在最上层，位置只由 `hud_x/hud_y` 决定，拖拽用手动命中测试实现，并把坐标钳在屏幕内。
+- **HUD 常驻（为什么必须用 `reshade_overlay`）**：`register_overlay` 注册的窗口只在面板打开时被调用（ReShade 的 `runtime_gui.cpp` 里 `if (widget.title == "OSD" ? show_splash_window : !_show_overlay) continue;`），所以 HUD 不能挂在那里；`addon_event::reshade_overlay` 是无条件派发的，而且那一帧的早退判断里有 `&& !has_addon_event<addon_event::reshade_overlay>()` —— **只要注册了这个事件，即使面板被 Home 关掉，ReShade 也会继续跑 ImGui 帧并渲染 draw data**。这正是 ShaderToggler 的 `ShaderTogglerInfo` 能常驻的原因。绘制本身用 `GetForegroundDrawList()` 按屏幕坐标画（不是窗口），所以不存在停靠/被面板遮挡；拖拽用手动命中测试，有窗口在鼠标下时让给窗口。
 - **像素哈希**：在 `init_resource`（有 `initial_data`）与 `update_texture_region`（CPU 上传）中计算，**与当前 hash_mode 无关**，因此运行中切换模式仍能看到已加载纹理；每张纹理最多扫描 512 KiB，超出按固定步长抽行；draw 中没有任何 `CopyResource` / `Map` 回读。
 - **候选冻结**：进入 Hunting 或点 `Refresh` 后，累积 `Frames to collect` 帧的候选并集，达到目标后停止采集并冻结列表。候选键是 `(纹理哈希, PS 哈希, VS 哈希)` 三元组。
 - **候选批量插入**：`record_draw_candidates` 先在栈上收集（固定 32 项，无堆分配），一次 `lock_guard` 批量写入 `frame_candidates`，一个 draw 只抢一次锁。

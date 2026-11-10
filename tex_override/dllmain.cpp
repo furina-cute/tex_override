@@ -4156,6 +4156,149 @@ static void on_present(
 // -----------------------------------------------------------------------------
 // ImGui
 // -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Hunting HUD —— 必须走 addon_event::reshade_overlay，而不是 register_overlay
+//
+// ReShade 6.8.0 的 runtime_gui.cpp 里，register_overlay 注册的窗口只在面板打开时
+// 才调用：
+//
+//     for (widget : info.overlay_callbacks)
+//         if (widget.title == "OSD" ? show_splash_window : !_show_overlay) continue;
+//         ... widget.callback(this);
+//     invoke_addon_event<addon_event::reshade_overlay>(this);
+//
+// 而 reshade_overlay 事件是无条件派发的；并且那一帧的早退判断里有
+//
+//     && !has_addon_event<addon_event::reshade_overlay>()
+//
+// 也就是说：只要注册了 reshade_overlay，即使 _show_overlay == false（面板被 Home
+// 关掉），ReShade 也会继续跑 ImGui 帧并渲染 draw data —— 这正是 ShaderToggler 的
+// ShaderTogglerInfo 能在面板关闭后常驻的原因。
+//
+// 绘制用前景绘制列表（不是窗口），所以不存在停靠/被面板遮挡的问题。
+// -----------------------------------------------------------------------------
+static void draw_hud(device_data *data)
+{
+	if (!data->hunting.load(std::memory_order_relaxed))
+		return;
+
+	const bool preview_enabled = data->preview_enabled.load(std::memory_order_relaxed);
+
+	// 只取当前选中的那一条候选，避免整份拷贝
+	candidate selected;
+	bool has_candidate = false;
+
+	{
+		std::lock_guard<std::mutex> lock(data->mutex);
+		if (data->candidate_index >= 0 &&
+			data->candidate_index < static_cast<int>(data->candidates.size()))
+		{
+			selected = data->candidates[data->candidate_index];
+			has_candidate = true;
+		}
+	}
+
+	char lines[8][160] = {};
+	int line_count = 0;
+	ImU32 line_color[8] = {};
+
+	const auto push_line = [&](const char *text, ImU32 color)
+	{
+		if (line_count >= 8)
+			return;
+		std::snprintf(lines[line_count], sizeof(lines[0]), "%s", text);
+		line_color[line_count] = color;
+		++line_count;
+	};
+
+	const ImU32 col_normal = IM_COL32(235, 235, 235, 255);
+	const ImU32 col_accent = IM_COL32(255, 217, 76, 255);
+	const ImU32 col_dim = IM_COL32(170, 170, 170, 255);
+
+	push_line("Hunting Mode: ON", col_accent);
+
+	if (has_candidate)
+	{
+		if (preview_enabled)
+			push_line("PREVIEW: candidate hidden", col_accent);
+
+		char buffer[160];
+		std::snprintf(buffer, sizeof(buffer), "tex: 0x%08X", selected.hash);
+		push_line(buffer, col_normal);
+		std::snprintf(buffer, sizeof(buffer), "ps:  0x%08X", selected.ps_hash);
+		push_line(buffer, col_normal);
+		std::snprintf(buffer, sizeof(buffer), "vs:  0x%08X", selected.vs_hash);
+		push_line(buffer, col_normal);
+		std::snprintf(buffer, sizeof(buffer), "fi=%u ic=%u", selected.first_index, selected.index_count);
+		push_line(buffer, col_normal);
+	}
+	else
+	{
+		push_line("Current: (none)", col_dim);
+	}
+
+	push_line("Numpad 1 / 2: Prev / Next", col_dim);
+	push_line("Numpad 3: Toggle Rule", col_dim);
+
+	ImDrawList *draw_list = ImGui::GetForegroundDrawList();
+	const float line_height = ImGui::GetTextLineHeight();
+	const float pad = 8.0f;
+
+	float text_width = 0.0f;
+	for (int i = 0; i < line_count; ++i)
+		text_width = std::max(text_width, ImGui::CalcTextSize(lines[i]).x);
+
+	const ImVec2 size(text_width + pad * 2.0f, line_height * static_cast<float>(line_count) + pad * 2.0f);
+	ImVec2 pos(data->hud_x, data->hud_y);
+
+	// 钳在屏幕内，避免拖出边界之后再找不回来
+	const ImVec2 display = ImGui::GetIO().DisplaySize;
+	pos.x = std::min(std::max(pos.x, 0.0f), std::max(0.0f, display.x - size.x));
+	pos.y = std::min(std::max(pos.y, 0.0f), std::max(0.0f, display.y - size.y));
+	data->hud_x = pos.x;
+	data->hud_y = pos.y;
+
+	const int alpha = static_cast<int>(std::min(std::max(data->hud_alpha, 0.05f), 1.0f) * 255.0f);
+
+	draw_list->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y),
+		IM_COL32(12, 12, 12, alpha), 5.0f);
+	draw_list->AddRect(pos, ImVec2(pos.x + size.x, pos.y + size.y),
+		IM_COL32(255, 255, 255, 45), 5.0f);
+
+	float y = pos.y + pad;
+	for (int i = 0; i < line_count; ++i)
+	{
+		draw_list->AddText(ImVec2(pos.x + pad, y), line_color[i], lines[i]);
+		y += line_height;
+	}
+
+	// 拖拽：鼠标压在 HUD 矩形上按住左键即可移动（不需要窗口）。
+	// 加 IsWindowHovered(AnyWindow)：HUD 是绘制列表、不消耗输入，盖在面板控件上时
+	// 让给面板，只有悬在游戏画面上才拖动。
+	const ImVec2 mouse = ImGui::GetIO().MousePos;
+	const bool hovered = mouse.x >= pos.x && mouse.x <= pos.x + size.x &&
+		mouse.y >= pos.y && mouse.y <= pos.y + size.y;
+
+	if (hovered && ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+		!ImGui::IsAnyItemActive() &&
+		!ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow))
+	{
+		data->hud_x += ImGui::GetIO().MouseDelta.x;
+		data->hud_y += ImGui::GetIO().MouseDelta.y;
+	}
+}
+
+// 每帧每 runtime 调用（面板开/关都会调用，见 draw_hud 的注释）
+static void on_reshade_overlay(effect_runtime *runtime)
+{
+	device *const dev = runtime->get_device();
+	device_data *data = get_device_data(dev);
+	if (data == nullptr)
+		return;
+
+	draw_hud(data);
+}
+
 static void draw_overlay(effect_runtime *runtime)
 {
 	device *const dev = runtime->get_device();
@@ -4895,106 +5038,8 @@ static void draw_overlay(effect_runtime *runtime)
 	}
 
 	// ---------------- HUD ----------------
-	//
-	// 用 ImGui 的**前景绘制列表**画，而不是 ImGui 窗口。原因：
-	//   - 窗口会被停靠/排到面板后面，用户看到的是"跑进 ReShade 面板里"；
-	//   - 绘制列表永远在一切窗口之上，位置只由 hud_x / hud_y 决定。
-	// 拖拽用手动命中测试实现（不依赖窗口标题栏）。
-	if (snapshot.hunting)
-	{
-		char lines[8][160] = {};
-		int line_count = 0;
-		ImU32 line_color[8] = {};
-
-		const auto push_line = [&](const char *text, ImU32 color)
-		{
-			if (line_count >= 8)
-				return;
-			std::snprintf(lines[line_count], sizeof(lines[0]), "%s", text);
-			line_color[line_count] = color;
-			++line_count;
-		};
-
-		const ImU32 col_normal = IM_COL32(235, 235, 235, 255);
-		const ImU32 col_accent = IM_COL32(255, 217, 76, 255);
-		const ImU32 col_dim = IM_COL32(170, 170, 170, 255);
-
-		push_line("Hunting Mode: ON", col_accent);
-
-		const bool has_candidate = view_index >= 0 && view_index < candidate_count;
-		if (has_candidate)
-		{
-			const candidate &selected = snapshot.candidates[view_index];
-
-			if (snapshot.preview_enabled)
-				push_line("PREVIEW: candidate hidden", col_accent);
-
-			char buffer[160];
-			std::snprintf(buffer, sizeof(buffer), "tex: 0x%08X", selected.hash);
-			push_line(buffer, col_normal);
-			std::snprintf(buffer, sizeof(buffer), "ps:  0x%08X", selected.ps_hash);
-			push_line(buffer, col_normal);
-			std::snprintf(buffer, sizeof(buffer), "vs:  0x%08X", selected.vs_hash);
-			push_line(buffer, col_normal);
-			std::snprintf(buffer, sizeof(buffer), "fi=%u ic=%u", selected.first_index, selected.index_count);
-			push_line(buffer, col_normal);
-		}
-		else
-		{
-			push_line("Current: (none)", col_dim);
-		}
-
-		push_line("Numpad 1 / 2: Prev / Next", col_dim);
-		push_line("Numpad 3: Toggle Rule", col_dim);
-
-		ImDrawList *draw_list = ImGui::GetForegroundDrawList();
-		const float line_height = ImGui::GetTextLineHeight();
-		const float pad = 8.0f;
-
-		float text_width = 0.0f;
-		for (int i = 0; i < line_count; ++i)
-			text_width = std::max(text_width, ImGui::CalcTextSize(lines[i]).x);
-
-		const ImVec2 size(text_width + pad * 2.0f, line_height * static_cast<float>(line_count) + pad * 2.0f);
-		ImVec2 pos(data->hud_x, data->hud_y);
-
-		// 钳在屏幕内，避免拖出边界之后再找不回来
-		const ImVec2 display = ImGui::GetIO().DisplaySize;
-		pos.x = std::min(std::max(pos.x, 0.0f), std::max(0.0f, display.x - size.x));
-		pos.y = std::min(std::max(pos.y, 0.0f), std::max(0.0f, display.y - size.y));
-		data->hud_x = pos.x;
-		data->hud_y = pos.y;
-
-		const int alpha = static_cast<int>(std::min(std::max(data->hud_alpha, 0.05f), 1.0f) * 255.0f);
-
-		draw_list->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y),
-			IM_COL32(12, 12, 12, alpha), 5.0f);
-		draw_list->AddRect(pos, ImVec2(pos.x + size.x, pos.y + size.y),
-			IM_COL32(255, 255, 255, 45), 5.0f);
-
-		float y = pos.y + pad;
-		for (int i = 0; i < line_count; ++i)
-		{
-			draw_list->AddText(ImVec2(pos.x + pad, y), line_color[i], lines[i]);
-			y += line_height;
-		}
-
-		// 拖拽：鼠标压在 HUD 矩形上按住左键即可移动（不需要窗口）。
-		// 加 IsWindowHovered(AnyWindow) 判断：HUD 是绘制列表、不消耗输入，
-		// 如果它盖在面板某个控件上，拖拽会和那次点击"打架"——有窗口在鼠标下时
-		// 让给窗口，只有悬在游戏画面上时才拖动 HUD。
-		const ImVec2 mouse = ImGui::GetIO().MousePos;
-		const bool hovered = mouse.x >= pos.x && mouse.x <= pos.x + size.x &&
-			mouse.y >= pos.y && mouse.y <= pos.y + size.y;
-
-		if (hovered && ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
-			!ImGui::IsAnyItemActive() &&
-			!ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow))
-		{
-			data->hud_x += ImGui::GetIO().MouseDelta.x;
-			data->hud_y += ImGui::GetIO().MouseDelta.y;
-		}
-	}
+	// HUD 不在这里画：面板关闭后本回调（register_overlay）根本不会被调用。
+	// 它由 on_reshade_overlay → draw_hud() 负责，详见那个函数的注释。
 
 	// ---------------- 离开 UI 后落实修改 ----------------
 	if (hunting_changed)
@@ -5201,6 +5246,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 		reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
 
 		reshade::register_overlay("Texture Override", draw_overlay);
+		// HUD 必须注册 reshade_overlay：面板关闭时 register_overlay 的回调不会被调用，
+		// 而这个事件会（并且能让 ReShade 继续跑 ImGui 帧）。见 draw_hud 的注释。
+		reshade::register_event<reshade::addon_event::reshade_overlay>(on_reshade_overlay);
 		break;
 
 	case DLL_PROCESS_DETACH:

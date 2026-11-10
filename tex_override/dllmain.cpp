@@ -1359,10 +1359,16 @@ static std::atomic<uint64_t> g_hunting_collect_epoch{ 1 };
 //
 // 目的：Numpad 1/2 只是换一个哈希数字，用户看不出画面上是哪个元素。
 // ShaderToggler / REST 的做法是步进时把当前 shader 隐藏，用"元素消失"来确认
-// 选中了什么；这里做成 draw 内的一次精确匹配（PS/VS 相等做廉价预筛，
-// 再比对绑定 SRV 的纹理哈希），语义上等于"这条候选覆盖的所有绘制"。
+// 选中了什么。
 //
-// 三字段 + seq 的 seqlock：overlay / present 线程写，多个 draw 线程读。
+// 关键要求：**预览必须与 Numpad 3 生成的规则行为完全一致**，否则"预览看到少一块"
+// 和"落规则后少一块"会对不上。所以这里带着 first_index / index_count，并且在
+// 判定时复刻 toggle_rule_for_candidate 的两条分支：
+//   1) stable_only 开启且候选有稳定锚点 → 生成的规则是 hash = *，
+//      命中条件 = shader + 几何；预览也直接返回 true（不查纹理哈希）
+//   2) 否则生成的规则带纹理哈希 → 预览才去遍历绑定 SRV 比对哈希
+//
+// 六个字段 + seq 的 seqlock：overlay / present 线程写，多个 draw 线程读。
 // 读到"写了一半"就放弃本次预览——宁可少隐藏一帧，也不做错匹配。
 // -----------------------------------------------------------------------------
 struct candidate_preview
@@ -1370,25 +1376,50 @@ struct candidate_preview
 	std::atomic<uint32_t> hash{ 0 };
 	std::atomic<uint32_t> ps_hash{ 0 };
 	std::atomic<uint32_t> vs_hash{ 0 };
+	std::atomic<uint32_t> first_index{ 0 };
+	std::atomic<uint32_t> index_count{ 0 };
 	std::atomic<bool> enabled{ false };
 	std::atomic<uint32_t> seq{ 0 };
 };
 
 static candidate_preview g_preview;
 
-static void set_candidate_preview(bool enabled, uint32_t hash, uint32_t ps_hash, uint32_t vs_hash)
+// 读侧的一次性快照（避免 seqlock 的字段撕裂）
+struct preview_target
+{
+	uint32_t hash = 0;
+	uint32_t ps_hash = 0;
+	uint32_t vs_hash = 0;
+	uint32_t first_index = 0;
+	uint32_t index_count = 0;
+};
+
+static void set_candidate_preview(
+	bool enabled,
+	uint32_t hash,
+	uint32_t ps_hash,
+	uint32_t vs_hash,
+	uint32_t first_index,
+	uint32_t index_count)
 {
 	g_preview.seq.fetch_add(1, std::memory_order_relaxed);
 	g_preview.hash.store(hash, std::memory_order_relaxed);
 	g_preview.ps_hash.store(ps_hash, std::memory_order_relaxed);
 	g_preview.vs_hash.store(vs_hash, std::memory_order_relaxed);
+	g_preview.first_index.store(first_index, std::memory_order_relaxed);
+	g_preview.index_count.store(index_count, std::memory_order_relaxed);
 	g_preview.enabled.store(enabled, std::memory_order_relaxed);
 	// release：保证前面几个 store 在序号变偶数之后对读侧可见
 	g_preview.seq.fetch_add(1, std::memory_order_release);
 }
 
+static void clear_candidate_preview()
+{
+	set_candidate_preview(false, 0, 0, 0, 0, 0);
+}
+
 // 读侧：序号为奇数或前后不一致（写者正在更新）时返回 false
-static bool read_candidate_preview(uint32_t &hash, uint32_t &ps_hash, uint32_t &vs_hash)
+static bool read_candidate_preview(preview_target &out)
 {
 	if (!g_preview.enabled.load(std::memory_order_relaxed))
 		return false;
@@ -1397,9 +1428,11 @@ static bool read_candidate_preview(uint32_t &hash, uint32_t &ps_hash, uint32_t &
 	if ((s1 & 1u) != 0)
 		return false;
 
-	hash = g_preview.hash.load(std::memory_order_relaxed);
-	ps_hash = g_preview.ps_hash.load(std::memory_order_relaxed);
-	vs_hash = g_preview.vs_hash.load(std::memory_order_relaxed);
+	out.hash = g_preview.hash.load(std::memory_order_relaxed);
+	out.ps_hash = g_preview.ps_hash.load(std::memory_order_relaxed);
+	out.vs_hash = g_preview.vs_hash.load(std::memory_order_relaxed);
+	out.first_index = g_preview.first_index.load(std::memory_order_relaxed);
+	out.index_count = g_preview.index_count.load(std::memory_order_relaxed);
 
 	return g_preview.seq.load(std::memory_order_acquire) == s1;
 }
@@ -2912,7 +2945,7 @@ static void on_destroy_device(device *dev)
 	g_texture_rules_active.store(false, std::memory_order_release);
 	g_hunting_collecting.store(false, std::memory_order_relaxed);
 	// 设备级状态全部失效：候选预览也要清掉，否则新设备会继续隐藏旧哈希
-	set_candidate_preview(false, 0, 0, 0);
+	clear_candidate_preview();
 	// 设备级资源全部失效：descriptor / 像素哈希缓存必须整体作废
 	g_resource_hash_epoch.fetch_add(1, std::memory_order_relaxed);
 	g_pixel_reset_epoch.fetch_add(1, std::memory_order_relaxed);
@@ -3101,15 +3134,18 @@ static void record_draw_candidates(
 }
 
 // -----------------------------------------------------------------------------
-// 候选预览匹配
+// 候选预览匹配 —— 必须复刻 toggle_rule_for_candidate 生成规则后的命中条件
 //
-// 只有 hunting 预览开启、且本次 draw 的 PS/VS 与候选一致时才走到这里
-// （两字段比较，绝大多数 draw 一次就退出）。命中判定：任意绑定 SRV 的纹理
-// 哈希等于候选哈希——与慢速通道共用同一份 bound_entry / 线程局部缓存，
-// 不额外产生 GetDesc。
+// 判定顺序（与"落规则"完全同构）：
+//   ① shader：候选的非 0 锚点必须与本次 draw 相等（0 表示当时没抓到，规则里等于通配）
+//   ② 几何：first_index / index_count 严格相等（规则里是单值集合）
+//   ③ stable_only 且候选有稳定锚点 → Numpad 3 生成的是 hash = * 规则，
+//      命中条件只有 shader + 几何，所以这里直接命中，**不查纹理哈希**
+//   ④ 否则规则会带纹理哈希 → 遍历绑定 SRV 比对哈希
+//      （与慢速通道共用同一份 bound_entry / 线程局部缓存，不额外 GetDesc）
 //
-// 语义上等于"这条候选覆盖的所有绘制"，因此同一纹理+同一 shader 的多个 draw
-// 会一起消失，这正是预览想要的：让用户看到候选覆盖了哪块画面。
+// 之前只比 shader + 纹理哈希，漏了 ②③：同一纹理在多个几何范围里使用时预览会
+// 隐藏过多；开了 stable_only 时预览又比规则范围小。现在两者严格等价。
 // -----------------------------------------------------------------------------
 static bool preview_covers_draw(
 	device *dev,
@@ -3118,17 +3154,26 @@ static bool preview_covers_draw(
 	bool pixel_mode,
 	const draw_context &ctx)
 {
-	uint32_t target_hash = 0;
-	uint32_t target_ps = 0;
-	uint32_t target_vs = 0;
-
-	if (!read_candidate_preview(target_hash, target_ps, target_vs))
+	preview_target target;
+	if (!read_candidate_preview(target))
 		return false;
 
-	// 候选记录时的稳定锚点必须一致（0 表示当时没抓到，按严格相等处理）
-	if (target_ps != ctx.ps_hash || target_vs != ctx.vs_hash)
+	// ① shader 条件
+	if (target.ps_hash != 0 && target.ps_hash != ctx.ps_hash)
+		return false;
+	if (target.vs_hash != 0 && target.vs_hash != ctx.vs_hash)
 		return false;
 
+	// ② 几何条件
+	if (target.first_index != ctx.first_index || target.index_count != ctx.index_count)
+		return false;
+
+	// ③ stable_only：生成的规则是 hash = *，只靠 shader + 几何命中
+	const bool has_stable_anchor = target.ps_hash != 0 || target.vs_hash != 0;
+	if (data->stable_only_rules.load(std::memory_order_relaxed) && has_stable_anchor)
+		return true;
+
+	// ④ 带纹理哈希的规则：遍历绑定 SRV
 	for (int stage = 0; stage < stage_count; ++stage)
 	{
 		stage_bindings &binding = cmd_data->stages[stage];
@@ -3165,7 +3210,7 @@ static bool preview_covers_draw(
 				}
 			}
 
-			if (hash != 0 && hash == target_hash)
+			if (hash != 0 && hash == target.hash)
 				return true;
 		}
 	}
@@ -3869,7 +3914,8 @@ static void process_hotkeys(device_data *data)
 		data->candidate_index >= 0 && data->candidate_index < count)
 	{
 		const candidate &selected = data->candidates[data->candidate_index];
-		set_candidate_preview(true, selected.hash, selected.ps_hash, selected.vs_hash);
+		set_candidate_preview(true, selected.hash, selected.ps_hash, selected.vs_hash,
+			selected.first_index, selected.index_count);
 	}
 }
 
@@ -3885,7 +3931,7 @@ static void restart_candidate_collection(device_data *data)
 	data->collecting.store(true, std::memory_order_relaxed);
 
 	// 候选全部重建，旧的预览目标已不存在
-	set_candidate_preview(false, 0, 0, 0);
+	clear_candidate_preview();
 
 	// 新纪元：先推进 epoch，再打开采集。各命令列表会在下一次 push/draw 时
 	// 丢弃挂机期间残留的陈旧 view 句柄，避免解引用已销毁的 SRV。
@@ -4078,7 +4124,7 @@ static void on_present(
 
 	// Hunting 关闭时清掉预览，避免"退出狩猎后画面还少一块"
 	if (!hunting)
-		set_candidate_preview(false, 0, 0, 0);
+		clear_candidate_preview();
 
 	{
 		std::lock_guard<std::mutex> lock(data->mutex);
@@ -4440,7 +4486,8 @@ static void draw_overlay(effect_runtime *runtime)
 			// 选中即预览：把这条候选对应的绘制立刻隐藏，用"元素消失"确认它是什么。
 			// 原子写 + seqlock，draw 线程随时可读，不需要走"意图 + 帧末落实"的路径。
 			if (snapshot.preview_enabled && snapshot.hunting)
-				set_candidate_preview(true, select_hash, select_ps, select_vs);
+				set_candidate_preview(true, select_hash, select_ps, select_vs,
+					snapshot.candidates[index].first_index, snapshot.candidates[index].index_count);
 		}
 	};
 
@@ -4571,12 +4618,13 @@ static void draw_overlay(effect_runtime *runtime)
 
 			if (!preview_enabled)
 			{
-				set_candidate_preview(false, 0, 0, 0);
+				clear_candidate_preview();
 			}
 			else if (snapshot.hunting && has_candidate)
 			{
 				const candidate &selected = snapshot.candidates[view_index];
-				set_candidate_preview(true, selected.hash, selected.ps_hash, selected.vs_hash);
+				set_candidate_preview(true, selected.hash, selected.ps_hash, selected.vs_hash,
+					selected.first_index, selected.index_count);
 			}
 		}
 		if (snapshot.hunting && snapshot.preview_skipped != 0)
@@ -5064,7 +5112,7 @@ static void draw_overlay(effect_runtime *runtime)
 
 		// 退出 Hunting：立刻取消预览，否则画面上会一直少一块
 		if (!hunting_value)
-			set_candidate_preview(false, 0, 0, 0);
+			clear_candidate_preview();
 	}
 
 	if (restart_requested && data->hunting.load(std::memory_order_relaxed))
@@ -5089,7 +5137,7 @@ static void draw_overlay(effect_runtime *runtime)
 		if (data->hunting.load(std::memory_order_relaxed))
 			restart_candidate_collection(data);
 		else
-			set_candidate_preview(false, 0, 0, 0); // 候选已清空，预览目标不再有效
+			clear_candidate_preview(); // 候选已清空，预览目标不再有效
 
 		log_info(new_hash_mode == static_cast<int>(hash_mode::pixel)
 			? "[Hash] switched to pixel content hash (only textures uploaded through the CPU have a hash)"

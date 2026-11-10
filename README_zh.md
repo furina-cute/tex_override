@@ -63,7 +63,8 @@ handling = skip
   - `skip`：命中后 `draw_indexed` 返回 `true`，取消整次绘制。
   - `replace` / `null`：把命中槽位绑定为 1x1 全透明 SRV，绘制继续。
 - `active`：`1` / `0`，默认 `1`。
-- `hotkey`：运行时热键，打包成 `(vk << 24) | (alt << 16) | (ctrl << 8) | shift`（与 ShaderToggler 的 `ToggleKey` 同格式），`0` / 省略表示未绑定。按下时**翻转该规则的 `active`**，立即生效、立即重发规则表；不自动写盘，需要点 `Save to INI` 才持久化。**不用手写**：面板 `Settings` 里点一下 `hotkey` 输入框，按任意键即捕获（`Backspace` 清除、`Escape` 取消），支持 `Alt` / `Ctrl` / `Shift` 组合，并在撞键时给出提示。
+- **`hotkey`**：运行时热键，打包成 `(vk << 24) | (alt << 16) | (ctrl << 8) | shift`（与 ShaderToggler 的 `ToggleKey` 同格式），`0` / 省略表示未绑定。按下时**翻转该规则的 `active`**，立即生效、立即重发规则表；不自动写盘，需要点 `Save to INI` 才持久化。**不用手写**：`Group settings` 里点 `Capture shortcut`，按任意键即捕获（`Esc` 取消、`Backspace` 清除），支持 `Alt`/`Ctrl`/`Shift` 组合，撞键时面板会提示。
+- **`name`**：组名（面板 `List of Toggle Groups` 与 INI 都显示）。节名仍然是 `[TextureOverride_<i>]`——加载器只认 `textureoverride` 前缀，改名会丢掉整段规则，所以名字单独存成 `name =`。
 
 所有 `[TextureOverride*]` 段落都会被读取；同时兼容旧的 `[TextureOverride]` + `0xHASH=1` 列表（等价于无上下文的 skip 规则）。旧式列表里 `0xHASH=0` 表示**该条目被禁用**（沿用 3DMigoto 习惯），不会生成规则。
 
@@ -178,17 +179,20 @@ tex_override\bin\x64\Release\tex_override.addon64
 - `Pixel hashes: N texture(s), X MB hashed`：像素哈希采集情况；为 0 时会提示原因。
 - 候选列表：进入 Hunting 后累积 `Frames to collect` 帧的候选并集，随后**冻结**；每条候选显示 `纹理哈希 / PS 哈希 / VS 哈希 / fi / ic`。
   - **点选即预览**：点某一行（或用 Numpad 1/2 步进）会立刻把该候选对应的绘制**隐藏**，用"元素消失"确认它是哪一块画面，再按 Numpad 3 落规则。开关是候选列表上方的 `Preview selected (hide it live)`（默认开）；旁边的 `preview hidden: N draw(s)` 是预览跳过的绘制数（不计入 `Skipped`）。
-- Rules 表格：`Tex / PS / VS / FI / IC / Mode / Act / Set / Del`。
+- `List of Toggle Groups`（对齐 ShaderToggler 的行式列表，默认展开）：每行是 `X | [序号] | Active 勾选 | Edit | Find | 组名 (热键, is active)`。
+  - `Edit` 打开 `Group settings`；`Find` 会开启 Hunting 并重新采集，随后用 Numpad 1/2 找元素、Numpad 3 增删该组的匹配项。
+  - 组名来自 INI 的 `name =`（`Save to INI` 会写回），没名字时显示 `<unnamed>`。
+- `Rule details`：原始哈希表 `Tex / PS / VS / FI / IC / Key / Mode / Act / Set / Del`（排查用；日常操作走上面的列表）。
 - 底部：`Save to INI` / `Reload from INI`；存在未保存修改时显示黄色 `(Unsaved)`。
 - 窗口默认尺寸会随分辨率收缩（屏幕高 < 600 或宽 < 800 时按 0.8 缩放）。
 
-`Group settings` 独立窗口（点击行内 `Settings` 打开）：可编辑 `hash`（支持 `*`）、`match_ps_hash`、`match_vs_hash`、`match_first_index`、`match_index_count`、`match_priority`、`handling`、`Active`，点 `Done` 应用并关闭。
+`Group settings` 独立窗口（点击行内 `Settings` / 列表里的 `Edit` 打开）：字段区可滚动，含 `name`、`hash`（支持 `*`）、`match_ps_hash`、`match_vs_hash`、`match_first_index`、`match_index_count`、`match_priority`、`handling`、`Active`、`hotkey`（`Capture shortcut` / `Clear` / `Cancel capture`），点 `Done` 应用并关闭。
 
 > **通配符与 replace**：`hash` 为 `*`（或留空）时，`handling` 下拉框会被禁用并提示 `Wildcard rules only support skip`——通配符规则没有可替换的目标纹理。即使 INI 里写了 `replace`，加载时也会被强制降级为 `skip` 并在日志中告警。
 >
 > **优先级**：通配符规则（`hash = *`）命中即**立即返回**，优先级绝对高于任何带纹理哈希的规则——即使后者的 `match_priority` 更高。若需要两者共存，请把纹理规则也改成通配符形式（用 `match_ps_hash` + 几何条件区分）。
 
-HUD 悬浮窗：Hunting 开启时显示在可配置位置，半透明背景，显示当前候选的纹理/PS/VS 哈希与绘制范围。预览开启且已选中候选时，HUD 顶部会显示黄色 `PREVIEW: candidate hidden`，避免把"画面少一块"误认为插件故障。可以直接用鼠标拖拽 HUD；拖拽后的坐标会同步回主面板的 `HUD X / HUD Y` 滑块。`HUD Alpha` 控制透明度。
+HUD：Hunting 开启时**用 ImGui 前景绘制列表画在屏幕坐标上**（不是一个 ImGui 窗口），因此永远在最上层、不会被停靠进 ReShade 面板，也不会被面板遮住。内容为 `Hunting Mode: ON` / `PREVIEW: candidate hidden`（预览开启且已选中候选时）/ 当前候选的 tex、ps、vs、fi、ic / 两行 Numpad 提示。按住左键直接拖拽即可移动，位置与透明度也可在面板 `HUD overlay` 里用 `HUD X / HUD Y / HUD Alpha` 调整；位置会被钳在屏幕内，拖出边界也能找回来。
 
 ### 3.4 热键
 
@@ -234,7 +238,9 @@ Hunting Mode 关闭时数字键完全无效。Hunting 关闭且规则为空、�
 - **跨 API 兼容**：`on_init_device` 用 `device::get_api()` 记录 `device_data::is_d3d11`。非 D3D11 时：`resolve_descriptor_hash` 直接返回 0（不做任何原生强转），`replace` 在决策点降级为 `skip` 并只警告一次；shader 哈希 / 通配符匹配不受影响。
 - **零锁热路径**：descriptor hash / pixel hash / shader hash 全部线程局部缓存 + 全局 epoch；`push_descriptors` / `draw_indexed` 中没有任何加锁。规则表发布为不可变快照（`std::atomic<const rule_table*>`），写时复制整体替换。
 - **候选预览**：hunting 时"点选/步进候选 → 立刻隐藏对应绘制"，用元素消失确认选中项（等价于 ShaderToggler/REST 的"步进即隐藏"）。实现是一个 32 位 seqlock（`candidate_preview`：hash / ps / vs / enabled + 序号），overlay 与 present 线程写、draw 线程读，读到写一半就放弃本帧预览，绝不做错匹配。匹配时先用 PS/VS 两个字段做廉价预筛（绝大多数 draw 一次比较就退出），命中同 shader 才遍历绑定 SRV，并复用慢速通道的 `bound_entry` / 线程局部哈希缓存，不额外产生 `GetDesc`。语义上等于"这条候选覆盖的所有绘制"，因此同一纹理+同一 shader 的多个 draw 会一起隐藏；预览与规则表完全解耦（没有合成规则、不写 INI），退出 Hunting 或清空候选时自动解除。它要求绑定表处于当前狩猎纪元（否则句柄可能悬垂），并且**优先于规则判定**——预览期间被隐藏的绘制不会再走规则匹配。
-- **键盘边沿与规则热键**：`poll_key_edges()` 每帧只采样一次整张 256 键表（`t_key_down` / `t_key_pressed`），Hunting 键与规则热键共用同一份快照——早期"每个键各自 `GetAsyncKeyState` 边沿"会让同一个键被两处查询时互相吞键。热键判定是"主键按下沿 + 修饰键严格相等"，修饰键同时检查 generic 与 L/R 两个 VK 码。捕获用**原始按键状态**而不是边沿快照，避免与 present 的轮询抢同一个边沿；捕获期间 `capturing_hotkey` 置位、并在关闭编辑器 / 重载 INI 时清零，防止规则热键被永久抑制。ImGui 抢键盘时用**截止时间戳**（250 ms）而不是布尔值抑制热键：叠加层关闭后 `draw_overlay` 不再被回调，布尔值会永久卡住。热键触发的翻转走 `publish_rules`（持 `publish_mutex`），并置 `has_unsaved_changes`。
+- **键盘边沿与规则热键**：`poll_key_edges()` 每帧只采样一次整张 256 键表（`t_key_down` / `t_key_pressed`），Hunting 键与规则热键共用同一份快照——早期"每个键各自 `GetAsyncKeyState` 边沿"会让同一个键被两处查询时互相吞键。热键判定是"主键按下沿 + 修饰键严格相等"，修饰键同时检查 generic 与 L/R 两个 VK 码。
+- **热键捕获**：捕获**在 present 线程完成**（`process_hotkey_capture`），overlay 只想"要不要捕获"（`capturing_hotkey`）和"捕获到了什么"（`captured_hotkey` + `hotkey_capture_seq` 序号），走与热键判定完全相同的按键读取路径。早期版本把捕获写在 `draw_overlay` 里、靠 `IsItemClicked()` 触发，实测点输入框没反应/按键不生效——UI 事件与原始按键状态是两套东西，不该混用。捕获跳过鼠标 1–6（避免"点按钮"被记成绑定）与修饰键本身，`Esc` 取消、`Backspace` 清除，成功时写一行 `[Hotkey] captured …` 日志。`Group settings` 的字段区放在可滚动子窗口里：窗口被缩小或行数变多时热键行不会掉到看不见的位置（这也是"点不到"的另一个来源）。
+- **HUD 用前景绘制列表**：Hunting 提示不是 ImGui 窗口，而是 `ImGui::GetForegroundDrawList()` 上按屏幕坐标画的矩形 + 文本。用窗口时会被停靠/排到面板后面（用户看到的就是"跑进 ReShade 面板里"）；绘制列表永远在最上层，位置只由 `hud_x/hud_y` 决定，拖拽用手动命中测试实现，并把坐标钳在屏幕内。
 - **像素哈希**：在 `init_resource`（有 `initial_data`）与 `update_texture_region`（CPU 上传）中计算，**与当前 hash_mode 无关**，因此运行中切换模式仍能看到已加载纹理；每张纹理最多扫描 512 KiB，超出按固定步长抽行；draw 中没有任何 `CopyResource` / `Map` 回读。
 - **候选冻结**：进入 Hunting 或点 `Refresh` 后，累积 `Frames to collect` 帧的候选并集，达到目标后停止采集并冻结列表。候选键是 `(纹理哈希, PS 哈希, VS 哈希)` 三元组。
 - **候选批量插入**：`record_draw_candidates` 先在栈上收集（固定 32 项，无堆分配），一次 `lock_guard` 批量写入 `frame_candidates`，一个 draw 只抢一次锁。
@@ -309,7 +315,7 @@ set HTTPS_PROXY=
 12. **view 句柄复用（已根治，见实现要点）**：早期版本中 `stage_bindings` 的哈希以 view 句柄为键，句柄被驱动复用成同一数值时会保留旧哈希。现在由「已销毁 view 的墓碑 + 命令列表水位线」精确摘除相关绑定。残余：`t_pixel_hits`（线程局部、以 view 句柄为键）无法跨线程精确摘除，只在 **pixel 模式** 下随 view 销毁整体失效；descriptor 模式不受影响。
 13. **`replace` 不会自动恢复原绑定**：ReShade 的 `draw_indexed` 在绘制**执行前**触发，回调里无法"画完再还原"。因此被替换的槽位会一直保持 1x1 透明，直到引擎自己重新绑定。若同一帧内有多个元素共用该槽位且不重绑，后续元素也会一起变透明。
 14. **epoch 是快照，不是锁**：私有数据访问靠"先比对全局 epoch"避免地址复用 UAF。若引擎在另一个线程销毁命令列表、而本线程恰在 `present` 中汇总它的计数器，仍存在极窄窗口（`flush_command_counters` 已改为每次迭代重新校验以缩短它）。彻底消除需要引用计数，未实现。
-15. **规则热键的边界**：键码是 Windows `VK_*`，**不区分左右修饰键**（绑 `RAlt` 会按 `Alt` 记录）；`Backspace` 被保留给"清除绑定"，因此不能把规则绑到 `Backspace`；多条规则同键会同时翻转（面板有提示但不阻止）；热键只在规则表非空、且不在捕获/输入状态时生效。
+15. **规则热键的边界**：键码是 Windows `VK_*`，**不区分左右修饰键**（绑 `RAlt` 会按 `Alt` 记录）；`Backspace` / `Esc` 被保留给"清除/取消"，不能作为绑定键；鼠标左/右/中/X1/X2 也不参与捕获（避免点按钮时被当成绑定）；多条规则同键会同时翻转（面板有提示但不阻止）；热键只在规则表非空、且不在捕获/输入状态时生效。
 
 ---
 

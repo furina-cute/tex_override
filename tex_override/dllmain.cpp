@@ -902,6 +902,7 @@ struct __declspec(uuid("6b0f4d2a-3c1e-4a7b-9f2d-1e5c8a9b0d31")) device_data
 	char edit_vs[16] = {};
 	char edit_first[512] = {};
 	char edit_count[512] = {};
+	char edit_name[96] = {};
 	int edit_priority = 0;
 	int edit_handling = 0;
 	bool edit_active = true;
@@ -914,8 +915,14 @@ struct __declspec(uuid("6b0f4d2a-3c1e-4a7b-9f2d-1e5c8a9b0d31")) device_data
 	std::atomic<bool> request_close_settings{ false };
 
 	// ---- 规则热键 ----
-	// 正在捕获新热键：期间不触发任何规则热键（否则按下的键会顺手翻转规则）
+	//
+	// 捕获**放在 present 线程做**（process_hotkey_capture），而不是在 ImGui 里靠
+	// IsItemClicked + GetAsyncKeyState：那条路径依赖"输入框真的被点中"，
+	// 而且与热键轮询分属两处、行为不一致。现在捕获与热键判定走同一条代码路径，
+	// 结果通过下面两个原子量交回 overlay 线程显示。
 	std::atomic<bool> capturing_hotkey{ false };
+	std::atomic<uint32_t> captured_hotkey{ 0 };     // 捕获到的打包值（0 = 清除）
+	std::atomic<uint32_t> hotkey_capture_seq{ 0 };  // 每次捕获完成 +1，overlay 据此取值
 	// ImGui 正在吃键盘（用户在输入框里打字）时的抑制截止时间（GetTickCount64，毫秒）。
 	// 用"截止时间"而不是布尔值：ReShade 在叠加层关闭时不再回调 draw_overlay，
 	// 布尔值会永久卡在 true，导致规则热键彻底失效；时间戳会自己过期。
@@ -923,13 +930,13 @@ struct __declspec(uuid("6b0f4d2a-3c1e-4a7b-9f2d-1e5c8a9b0d31")) device_data
 	// 编辑中的热键（仅 overlay 线程；点 Done 才写回规则）
 	uint32_t edit_hotkey = 0;
 	bool edit_hotkey_capturing = false;
+	uint32_t hotkey_capture_seq_seen = 0;
 
-	// HUD 悬浮窗（仅 overlay 线程访问）
-	float hud_x = 24.0f;
-	float hud_y = 24.0f;
+	// HUD：用前景绘制列表画（不是 ImGui 窗口），因此永远不会被面板/停靠吞掉。
+	// 仅 overlay 线程访问。
+	float hud_x = 12.0f;
+	float hud_y = 12.0f;
 	float hud_alpha = 0.75f;
-	bool hud_pos_initialized = false;
-	bool hud_pos_dirty = false;
 
 	// Group settings 焦点
 	bool focus_hash_next = false;
@@ -1950,6 +1957,10 @@ static void load_config(device_data *data)
 			else
 				mark_invalid("active must be 0 or 1");
 		}
+		else if (key == "name")
+		{
+			current.name = value; // 组名（面板显示 / List of Toggle Groups）
+		}
 		else if (key == "hotkey")
 		{
 			// 打包值：(vk << 24) | (alt << 16) | (ctrl << 8) | shift
@@ -2039,6 +2050,19 @@ static bool save_config(std::vector<texture_override_rule> rules, int hash_mode_
 			const texture_override_rule &rule = rules[i];
 
 			file << "[TextureOverride_" << i << "]\n";
+
+			// 组名单独存成 name=，section 名保持 [TextureOverride_<i>] 不变——
+			// 加载器只认 "textureoverride" 前缀，改名会直接丢掉整段规则。
+			if (!rule.name.empty())
+			{
+				std::string safe_name;
+				for (char ch : rule.name)
+				{
+					// ';' / '#' / CR / LF 会破坏手写 INI 语法，统一替换
+					safe_name += (ch == ';' || ch == '#' || ch == '\r' || ch == '\n') ? '_' : ch;
+				}
+				file << "name = " << safe_name << "\n";
+			}
 
 			if (rule.hash_any)
 			{
@@ -3613,6 +3637,66 @@ static void process_rule_hotkeys(device_data *data)
 	data->has_unsaved_changes.store(true, std::memory_order_relaxed);
 }
 
+// -----------------------------------------------------------------------------
+// 热键捕获（present 线程）
+//
+// 早期把捕获写在 draw_overlay 里、依赖 IsItemClicked + GetAsyncKeyState，
+// 实测"点输入框没反应 / 按键不生效"。现在改成与热键判定**同一条代码路径**：
+//   - overlay 线程只负责置 capturing_hotkey（点 Capture 按钮或点输入框）
+//   - present 线程每帧扫描真实按键状态，命中后写 captured_hotkey + seq
+//   - overlay 线程下一帧发现 seq 变化，落到 edit_hotkey
+// 规则：跳过鼠标 1..6（避免"点按钮"被记成绑定）、跳过修饰键本身（只作组合位）、
+// Escape 取消、Backspace 清除。非捕获态直接 return，零开销。
+// -----------------------------------------------------------------------------
+static void process_hotkey_capture(device_data *data)
+{
+	if (!data->capturing_hotkey.load(std::memory_order_relaxed))
+		return;
+
+	const auto finish = [&](uint32_t packed, const char *reason)
+	{
+		data->captured_hotkey.store(packed, std::memory_order_relaxed);
+		data->hotkey_capture_seq.fetch_add(1, std::memory_order_relaxed);
+		data->capturing_hotkey.store(false, std::memory_order_relaxed);
+
+		char message[192];
+		if (packed != 0)
+			std::snprintf(message, sizeof(message), "[Hotkey] captured %s (0x%08X)",
+				hotkey_to_string(packed).c_str(), packed);
+		else
+			std::snprintf(message, sizeof(message), "[Hotkey] %s", reason);
+		log_info(message);
+	};
+
+	if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0)
+	{
+		finish(0, "capture cancelled (Escape)");
+		return;
+	}
+	if ((GetAsyncKeyState(VK_BACK) & 0x8000) != 0)
+	{
+		finish(0, "shortcut cleared (Backspace)");
+		return;
+	}
+
+	const bool alt = (GetAsyncKeyState(VK_LMENU) & 0x8000) != 0 || (GetAsyncKeyState(VK_RMENU) & 0x8000) != 0;
+	const bool ctrl = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0 || (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
+	const bool shift = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0 || (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
+
+	for (int vk = 1; vk < 256; ++vk)
+	{
+		if (vk <= VK_XBUTTON2)  // 1..6：鼠标左/右/中/X1/X2
+			continue;
+		if (is_modifier_vk(vk))
+			continue;
+		if ((GetAsyncKeyState(vk) & 0x8000) == 0)
+			continue;
+
+		finish(make_hotkey(vk, alt, ctrl, shift), "");
+		return;
+	}
+}
+
 static void toggle_rule_for_candidate(device_data *data)
 {
 	// 先在 data 锁内取出候选，随后基于不可变规则表做写时复制
@@ -3927,6 +4011,7 @@ static void on_present(
 	poll_key_edges();
 
 	process_hotkeys(data);
+	process_hotkey_capture(data);
 	process_rule_hotkeys(data);
 
 	log_watchdog(data);
@@ -4031,6 +4116,23 @@ static void draw_overlay(effect_runtime *runtime)
 		// 关掉编辑器的同时退出热键捕获态，否则规则热键会被永久抑制
 		data->edit_hotkey_capturing = false;
 		data->capturing_hotkey.store(false, std::memory_order_relaxed);
+	}
+
+	// 消费 present 线程捕获到的热键（seq 变化 = 有新结果）
+	{
+		const uint32_t capture_seq = data->hotkey_capture_seq.load(std::memory_order_relaxed);
+		if (capture_seq != data->hotkey_capture_seq_seen)
+		{
+			data->hotkey_capture_seq_seen = capture_seq;
+			data->edit_hotkey = data->captured_hotkey.load(std::memory_order_relaxed);
+			data->edit_hotkey_capturing = false;
+		}
+		else if (data->edit_hotkey_capturing &&
+			!data->capturing_hotkey.load(std::memory_order_relaxed))
+		{
+			// 捕获态在别处结束（窗口被关、请求关闭等）：同步 UI，别卡在"按任意键"
+			data->edit_hotkey_capturing = false;
+		}
 	}
 
 	// 1) 锁内只做快照
@@ -4239,12 +4341,11 @@ static void draw_overlay(effect_runtime *runtime)
 
 		if (ImGui::CollapsingHeader("HUD overlay"))
 		{
-			if (ImGui::SliderFloat("HUD X", &data->hud_x, 0.0f, 3000.0f, "%.0f"))
-				data->hud_pos_dirty = true;
-			if (ImGui::SliderFloat("HUD Y", &data->hud_y, 0.0f, 2000.0f, "%.0f"))
-				data->hud_pos_dirty = true;
+			// HUD 是前景绘制列表（不是窗口），所以位置完全由这两个值决定
+			ImGui::SliderFloat("HUD X", &data->hud_x, 0.0f, 3000.0f, "%.0f");
+			ImGui::SliderFloat("HUD Y", &data->hud_y, 0.0f, 2000.0f, "%.0f");
 			ImGui::SliderFloat("HUD Alpha", &data->hud_alpha, 0.1f, 1.0f, "%.2f");
-			ImGui::TextDisabled("You can also drag the HUD window directly.");
+			ImGui::TextDisabled("Drag the HUD itself to move it; it is drawn on top of every panel.");
 		}
 
 		ImGui::Separator();
@@ -4329,7 +4430,65 @@ static void draw_overlay(effect_runtime *runtime)
 
 		ImGui::Separator();
 
-		// Rules 表格
+		// ---- List of Toggle Groups（对齐 ShaderToggler 的行式列表）----
+		// 组的来源就是规则：Hunting（Numpad 3）建组，或手写 INI。
+		if (ImGui::CollapsingHeader("List of Toggle Groups", ImGuiTreeNodeFlags_DefaultOpen))
+		{
+			ImGui::TextDisabled("Groups are created with Hunting Mode (Numpad 3) or by editing the INI.");
+
+			ImGui::BeginChild("##groups", ImVec2(0.0f, 150.0f), true);
+
+			for (int i = 0; i < static_cast<int>(snapshot.rules.size()); ++i)
+			{
+				const texture_override_rule &rule = snapshot.rules[i];
+				ImGui::PushID(2000 + i);
+
+				if (ImGui::Button("X"))
+					remove_index = i;
+
+				ImGui::SameLine();
+				ImGui::Text("[%d]", i);
+
+				ImGui::SameLine();
+				bool group_active = rule.active;
+				if (ImGui::Checkbox("##group_active", &group_active))
+				{
+					active_index = i;
+					active_value = group_active;
+				}
+
+				ImGui::SameLine();
+				if (ImGui::Button("Edit"))
+					open_settings_index = i;
+
+				ImGui::SameLine();
+				if (ImGui::Button("Find"))
+				{
+					// 开启 Hunting 并重新采集：随后用 Numpad 1/2 找元素、Numpad 3 增删匹配项
+					hunting_value = true;
+					hunting_changed = true;
+					restart_requested = true;
+				}
+
+				ImGui::SameLine();
+				ImGui::Text("%s (%s%s)",
+					rule.name.empty() ? "<unnamed>" : rule.name.c_str(),
+					rule.hotkey != 0 ? hotkey_to_string(rule.hotkey).c_str() : "no key",
+					rule.active ? ", is active" : "");
+
+				ImGui::PopID();
+			}
+
+			if (snapshot.rules.empty())
+				ImGui::TextDisabled("No groups yet.");
+
+			ImGui::EndChild();
+		}
+
+		ImGui::Separator();
+
+		// Rule details：原始哈希表（排查用；日常操作走上面的列表）
+		ImGui::TextDisabled("Rule details");
 		if (ImGui::BeginTable("##rules", 10,
 			ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
 		{
@@ -4440,6 +4599,8 @@ static void draw_overlay(effect_runtime *runtime)
 		data->edit_priority = rule.priority;
 		data->edit_handling = rule.handling == handling_mode::skip ? 0 : 1;
 		data->edit_active = rule.active;
+		// 组名（写回 INI 的 name=，面板与"List of Toggle Groups"都显示它）
+		std::snprintf(data->edit_name, sizeof(data->edit_name), "%s", rule.name.c_str());
 		// 热键编辑：进入时把当前绑定拷进编辑缓冲，捕获状态清零
 		data->edit_hotkey = rule.hotkey;
 		data->edit_hotkey_capturing = false;
@@ -4473,7 +4634,7 @@ static void draw_overlay(effect_runtime *runtime)
 		bool window_open = true;
 		bool settings_done = false;
 
-		ImGui::SetNextWindowSize(ImVec2(480.0f, 460.0f), ImGuiCond_FirstUseEver);
+		ImGui::SetNextWindowSize(ImVec2(520.0f, 620.0f), ImGuiCond_FirstUseEver);
 		ImGui::Begin("Group settings", &window_open);
 
 		if (data->settings_index < 0)
@@ -4482,6 +4643,10 @@ static void draw_overlay(effect_runtime *runtime)
 		}
 		else
 		{
+			// 字段区放进可滚动子窗口：窗口被缩小时热键行不会"掉到看不见的地方"
+			// （之前固定 480x460，加了 name / hotkey 两行后就超出可视区）。
+			ImGui::BeginChild("##settings_body", ImVec2(0.0f, -56.0f), false);
+
 			if (data->focus_hash_next)
 			{
 				ImGui::SetKeyboardFocusHere();
@@ -4489,6 +4654,7 @@ static void draw_overlay(effect_runtime *runtime)
 			}
 
 			ImGui::TextDisabled("Conditions are AND; empty / * means \"any\".");
+			ImGui::InputText("name", data->edit_name, sizeof(data->edit_name));
 			ImGui::InputText("hash (or *)", data->edit_hash, sizeof(data->edit_hash));
 			ImGui::InputText("match_ps_hash", data->edit_ps, sizeof(data->edit_ps));
 			ImGui::InputText("match_vs_hash", data->edit_vs, sizeof(data->edit_vs));
@@ -4517,66 +4683,40 @@ static void draw_overlay(effect_runtime *runtime)
 			ImGui::Checkbox("Active", &data->edit_active);
 
 			// ---- 运行时热键（捕获式）----
-			// 点输入框进入捕获；捕获期间 present 线程不触发任何规则热键。
-			// Backspace 清除，Escape 取消。
+			// 捕获在 present 线程完成（process_hotkey_capture），这里只发起请求、显示结果。
 			{
-				char hotkey_buffer[64] = {};
-				std::snprintf(hotkey_buffer, sizeof(hotkey_buffer), "%s",
-					data->edit_hotkey_capturing
-						? "Press a key... (Backspace clears, Escape cancels)"
-						: hotkey_to_string(data->edit_hotkey).c_str());
-
-				ImGui::InputText("hotkey", hotkey_buffer, sizeof(hotkey_buffer),
-					ImGuiInputTextFlags_ReadOnly);
-
-				if (ImGui::IsItemClicked() || ImGui::IsItemActivated())
-				{
-					if (!data->edit_hotkey_capturing)
-					{
-						data->edit_hotkey_capturing = true;
-						data->capturing_hotkey.store(true, std::memory_order_relaxed);
-					}
-				}
+				ImGui::Separator();
+				ImGui::TextDisabled("Runtime shortcut (toggles this rule in-game)");
 
 				if (data->edit_hotkey_capturing)
 				{
-					// 用原始按键状态捕获，不走边沿快照——避免与 present 的轮询互相吞键
-					if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0)
+					ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+						"Press any key now (Esc cancels, Backspace clears)...");
+
+					if (ImGui::Button("Cancel capture"))
 					{
 						data->edit_hotkey_capturing = false;
 						data->capturing_hotkey.store(false, std::memory_order_relaxed);
-					}
-					else if ((GetAsyncKeyState(VK_BACK) & 0x8000) != 0)
-					{
-						data->edit_hotkey = 0;
-						data->edit_hotkey_capturing = false;
-						data->capturing_hotkey.store(false, std::memory_order_relaxed);
-					}
-					else
-					{
-						for (int vk = 8; vk < 256; ++vk)
-						{
-							if (is_modifier_vk(vk))
-								continue;
-							if ((GetAsyncKeyState(vk) & 0x8000) == 0)
-								continue;
-
-							const bool alt = (GetAsyncKeyState(VK_LMENU) & 0x8000) != 0 ||
-								(GetAsyncKeyState(VK_RMENU) & 0x8000) != 0;
-							const bool ctrl = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0 ||
-								(GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
-							const bool shift = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0 ||
-								(GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
-
-							data->edit_hotkey = make_hotkey(vk, alt, ctrl, shift);
-							data->edit_hotkey_capturing = false;
-							data->capturing_hotkey.store(false, std::memory_order_relaxed);
-							break;
-						}
 					}
 				}
+				else
+				{
+					if (ImGui::Button("Capture shortcut"))
+					{
+						data->edit_hotkey_capturing = true;
+						data->capturing_hotkey.store(true, std::memory_order_relaxed);
+						log_info("[Hotkey] capture started; press any key");
+					}
 
-				// 与其它规则撞键时给出提示（两边都会触发；不阻止）
+					ImGui::SameLine();
+					if (ImGui::Button("Clear"))
+						data->edit_hotkey = 0;
+
+					ImGui::SameLine();
+					ImGui::Text("Current: %s", hotkey_to_string(data->edit_hotkey).c_str());
+				}
+
+				// 与其它规则撞键时提示（两边都会触发；不阻止）
 				if (data->edit_hotkey != 0)
 				{
 					int conflicts = 0;
@@ -4596,14 +4736,16 @@ static void draw_overlay(effect_runtime *runtime)
 					}
 					else
 					{
-						ImGui::TextDisabled("Toggling at runtime does not write the INI; press Save to INI to keep it.");
+						ImGui::TextDisabled("Runtime toggling does not write the INI; press Save to INI to keep it.");
 					}
 				}
 				else
 				{
-					ImGui::TextDisabled("No shortcut. Click the field and press a key (Backspace clears).");
+					ImGui::TextDisabled("No shortcut yet. Click Capture, then press any key.");
 				}
 			}
+
+			ImGui::EndChild();
 
 			if (!data->settings_error.empty())
 				ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", data->settings_error.c_str());
@@ -4670,6 +4812,7 @@ static void draw_overlay(effect_runtime *runtime)
 						: handling_mode::replace;
 					apply_settings_rule.active = data->edit_active;
 					apply_settings_rule.hotkey = data->edit_hotkey;
+					apply_settings_rule.name = trim_copy(data->edit_name);
 
 					apply_settings = true;
 					apply_settings_index = data->settings_index;
@@ -4694,60 +4837,105 @@ static void draw_overlay(effect_runtime *runtime)
 	}
 
 	// ---------------- HUD ----------------
+	//
+	// 用 ImGui 的**前景绘制列表**画，而不是 ImGui 窗口。原因：
+	//   - 窗口会被停靠/排到面板后面，用户看到的是"跑进 ReShade 面板里"；
+	//   - 绘制列表永远在一切窗口之上，位置只由 hud_x / hud_y 决定。
+	// 拖拽用手动命中测试实现（不依赖窗口标题栏）。
 	if (snapshot.hunting)
 	{
-		// 只有滑块/首次显示时强制位置；其余时间让 ImGui 自己维护拖拽后的位置
-		const bool apply_position = data->hud_pos_dirty || !data->hud_pos_initialized;
+		char lines[8][160] = {};
+		int line_count = 0;
+		ImU32 line_color[8] = {};
 
-		if (apply_position)
-			ImGui::SetNextWindowPos(ImVec2(data->hud_x, data->hud_y), ImGuiCond_Always);
-
-		ImGui::SetNextWindowBgAlpha(data->hud_alpha);
-
-		const ImGuiWindowFlags flags =
-			ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-			ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
-			ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
-
-		const bool hud_open = ImGui::Begin("##texovr_hud", nullptr, flags);
-		const ImVec2 hud_pos = ImGui::GetWindowPos();
-
-		if (hud_open)
+		const auto push_line = [&](const char *text, ImU32 color)
 		{
-			ImGui::TextUnformatted("Hunting Mode: ON");
+			if (line_count >= 8)
+				return;
+			std::snprintf(lines[line_count], sizeof(lines[0]), "%s", text);
+			line_color[line_count] = color;
+			++line_count;
+		};
 
-			const bool has_candidate = view_index >= 0 && view_index < candidate_count;
-			if (has_candidate)
-			{
-				const candidate &selected = snapshot.candidates[view_index];
-				// 让用户知道"画面少一块"是预览，而不是规则/插件出错
-				if (snapshot.preview_enabled)
-					ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "PREVIEW: candidate hidden");
+		const ImU32 col_normal = IM_COL32(235, 235, 235, 255);
+		const ImU32 col_accent = IM_COL32(255, 217, 76, 255);
+		const ImU32 col_dim = IM_COL32(170, 170, 170, 255);
 
-				ImGui::Text("tex: 0x%08X", selected.hash);
-				ImGui::Text("ps:  0x%08X", selected.ps_hash);
-				ImGui::Text("vs:  0x%08X", selected.vs_hash);
-				ImGui::Text("fi=%u ic=%u", selected.first_index, selected.index_count);
-			}
-			else
-			{
-				ImGui::TextUnformatted("Current: (none)");
-			}
+		push_line("Hunting Mode: ON", col_accent);
 
-			ImGui::TextUnformatted("Numpad 1 / 2: Prev / Next");
-			ImGui::TextUnformatted("Numpad 3: Toggle Rule");
-			ImGui::TextDisabled("Drag to move");
+		const bool has_candidate = view_index >= 0 && view_index < candidate_count;
+		if (has_candidate)
+		{
+			const candidate &selected = snapshot.candidates[view_index];
+
+			if (snapshot.preview_enabled)
+				push_line("PREVIEW: candidate hidden", col_accent);
+
+			char buffer[160];
+			std::snprintf(buffer, sizeof(buffer), "tex: 0x%08X", selected.hash);
+			push_line(buffer, col_normal);
+			std::snprintf(buffer, sizeof(buffer), "ps:  0x%08X", selected.ps_hash);
+			push_line(buffer, col_normal);
+			std::snprintf(buffer, sizeof(buffer), "vs:  0x%08X", selected.vs_hash);
+			push_line(buffer, col_normal);
+			std::snprintf(buffer, sizeof(buffer), "fi=%u ic=%u", selected.first_index, selected.index_count);
+			push_line(buffer, col_normal);
+		}
+		else
+		{
+			push_line("Current: (none)", col_dim);
 		}
 
-		ImGui::End();
+		push_line("Numpad 1 / 2: Prev / Next", col_dim);
+		push_line("Numpad 3: Toggle Rule", col_dim);
 
-		// 拖拽后的位置同步回主面板滑块
-		data->hud_x = hud_pos.x;
-		data->hud_y = hud_pos.y;
-		data->hud_pos_initialized = true;
+		ImDrawList *draw_list = ImGui::GetForegroundDrawList();
+		const float line_height = ImGui::GetTextLineHeight();
+		const float pad = 8.0f;
 
-		if (apply_position)
-			data->hud_pos_dirty = false;
+		float text_width = 0.0f;
+		for (int i = 0; i < line_count; ++i)
+			text_width = std::max(text_width, ImGui::CalcTextSize(lines[i]).x);
+
+		const ImVec2 size(text_width + pad * 2.0f, line_height * static_cast<float>(line_count) + pad * 2.0f);
+		ImVec2 pos(data->hud_x, data->hud_y);
+
+		// 钳在屏幕内，避免拖出边界之后再找不回来
+		const ImVec2 display = ImGui::GetIO().DisplaySize;
+		pos.x = std::min(std::max(pos.x, 0.0f), std::max(0.0f, display.x - size.x));
+		pos.y = std::min(std::max(pos.y, 0.0f), std::max(0.0f, display.y - size.y));
+		data->hud_x = pos.x;
+		data->hud_y = pos.y;
+
+		const int alpha = static_cast<int>(std::min(std::max(data->hud_alpha, 0.05f), 1.0f) * 255.0f);
+
+		draw_list->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y),
+			IM_COL32(12, 12, 12, alpha), 5.0f);
+		draw_list->AddRect(pos, ImVec2(pos.x + size.x, pos.y + size.y),
+			IM_COL32(255, 255, 255, 45), 5.0f);
+
+		float y = pos.y + pad;
+		for (int i = 0; i < line_count; ++i)
+		{
+			draw_list->AddText(ImVec2(pos.x + pad, y), line_color[i], lines[i]);
+			y += line_height;
+		}
+
+		// 拖拽：鼠标压在 HUD 矩形上按住左键即可移动（不需要窗口）。
+		// 加 IsWindowHovered(AnyWindow) 判断：HUD 是绘制列表、不消耗输入，
+		// 如果它盖在面板某个控件上，拖拽会和那次点击"打架"——有窗口在鼠标下时
+		// 让给窗口，只有悬在游戏画面上时才拖动 HUD。
+		const ImVec2 mouse = ImGui::GetIO().MousePos;
+		const bool hovered = mouse.x >= pos.x && mouse.x <= pos.x + size.x &&
+			mouse.y >= pos.y && mouse.y <= pos.y + size.y;
+
+		if (hovered && ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+			!ImGui::IsAnyItemActive() &&
+			!ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow))
+		{
+			data->hud_x += ImGui::GetIO().MouseDelta.x;
+			data->hud_y += ImGui::GetIO().MouseDelta.y;
+		}
 	}
 
 	// ---------------- 离开 UI 后落实修改 ----------------
@@ -4873,7 +5061,9 @@ static void draw_overlay(effect_runtime *runtime)
 
 		if (apply_settings_index < static_cast<int>(rules.size()))
 		{
-			apply_settings_rule.name = rules[apply_settings_index].name;
+			// 名字已经在编辑器里编辑过（edit_name），不再用旧值覆盖
+			if (apply_settings_rule.name.empty())
+				apply_settings_rule.name = rules[apply_settings_index].name;
 			rules[apply_settings_index] = std::move(apply_settings_rule);
 
 			publish_rules(data, std::move(rules));

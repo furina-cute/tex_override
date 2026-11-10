@@ -3397,21 +3397,33 @@ static bool on_draw_indexed(
 // 热键（仅 Hunting Mode 生效）
 // -----------------------------------------------------------------------------
 // -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // 键盘边沿：每帧采样一次，供"规则热键"与"Hunting 键"共用
 //
-// 早期是每个键各自调用 key_pressed_edge()：同一个键若被两处查询，第一次消费掉
-// 边沿后第二次必然返回 false（互相吞键）。现在改成一次采样整张 256 键表：
-// 规则热键、Hunting 键、以及"捕获热键"都读同一份快照。
-// 代价是每帧 256 次 GetAsyncKeyState（用户态、无系统调用），可忽略。
+// 为什么不用 GetAsyncKeyState：ReShade 用 inline hook 包了它，并在
+//
+//     block_input = _input_processing_mode != 0 && (_show_overlay || ...)
+//     block_keyboard_input = block_input && imgui_io.WantCaptureKeyboard
+//     _input->block_keyboard_input(block_keyboard_input)
+//
+// 为真时让 HookGetAsyncKeyState 对所有键盘键返回 0（它要屏蔽游戏对面板按键的感知，
+// 但我们这个第三方 addon 调到的也是同一个被 hook 的函数）。于是"打开面板、焦点在
+// 输入框里按捕获键"恰好是它返回 0 的场景 —— 旧实现永远读不到按键。
+//
+// ReShade 自己的 is_key_down / is_key_pressed 读的是窗口消息驱动的 _keys 位图，
+// 不受那个 hook 影响；ShaderToggler 正是这么做的。这里改成从 effect_runtime 采样。
 // -----------------------------------------------------------------------------
 static thread_local std::array<bool, 256> t_key_down{};
 static thread_local std::array<bool, 256> t_key_pressed{};
 
-static void poll_key_edges()
+static void poll_key_edges(effect_runtime *runtime)
 {
+	if (runtime == nullptr)
+		return;
+
 	for (unsigned vk = 0; vk < 256; ++vk)
 	{
-		const bool down = (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
+		const bool down = runtime->is_key_down(vk);
 		t_key_pressed[vk] = down && !t_key_down[vk];
 		t_key_down[vk] = down;
 	}
@@ -3638,20 +3650,47 @@ static void process_rule_hotkeys(device_data *data)
 }
 
 // -----------------------------------------------------------------------------
-// 热键捕获（present 线程）
+// 热键捕获（reshade_present 线程，用 effect_runtime 的按键状态）
 //
-// 早期把捕获写在 draw_overlay 里、依赖 IsItemClicked + GetAsyncKeyState，
-// 实测"点输入框没反应 / 按键不生效"。现在改成与热键判定**同一条代码路径**：
-//   - overlay 线程只负责置 capturing_hotkey（点 Capture 按钮或点输入框）
-//   - present 线程每帧扫描真实按键状态，命中后写 captured_hotkey + seq
-//   - overlay 线程下一帧发现 seq 变化，落到 edit_hotkey
-// 规则：跳过鼠标 1..6（避免"点按钮"被记成绑定）、跳过修饰键本身（只作组合位）、
-// Escape 取消、Backspace 清除。非捕获态直接 return，零开销。
+// 早期版本用 GetAsyncKeyState 在 draw_overlay 里捕获，实测完全读不到按键：
+// ReShade 用 inline hook 包了 GetAsyncKeyState，一旦面板打开且 ImGui 想吃键盘
+// （点 Capture 按钮之后正是这个状态），HookGetAsyncKeyState 对所有键盘键返回 0。
+// 现在改为读 effect_runtime 的按键状态（窗口消息驱动的 _keys 位图，不受该 hook 影响），
+// 与 ShaderToggler 的 KeyData::collectKeysPressed 同一套数据源。
+//
+// 流程不变：overlay 只置 capturing_hotkey，这里命中后写 captured_hotkey + seq。
+// 规则：跳过鼠标 1..6、跳过修饰键本身，Esc 取消、Backspace 清除。
 // -----------------------------------------------------------------------------
 static void process_hotkey_capture(device_data *data)
 {
+	// 捕获心跳：每 3 秒写一行"当前看到几个键按下"，把"按了没反应"变成可诊断的日志。
+	static uint64_t s_last_heartbeat = 0;
+
 	if (!data->capturing_hotkey.load(std::memory_order_relaxed))
+	{
+		s_last_heartbeat = 0;
 		return;
+	}
+
+	{
+		const uint64_t now = GetTickCount64();
+		if (s_last_heartbeat == 0 || now - s_last_heartbeat >= 3000)
+		{
+			s_last_heartbeat = now;
+
+			int downs = 0;
+			for (int vk = 8; vk < 256; ++vk)
+			{
+				if (!is_modifier_vk(vk) && key_down(vk))
+					++downs;
+			}
+
+			char message[128];
+			std::snprintf(message, sizeof(message),
+				"[Hotkey] waiting for a key... (runtime sees %d key(s) down)", downs);
+			log_info(message);
+		}
+	}
 
 	const auto finish = [&](uint32_t packed, const char *reason)
 	{
@@ -3668,20 +3707,20 @@ static void process_hotkey_capture(device_data *data)
 		log_info(message);
 	};
 
-	if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0)
+	if (key_pressed(VK_ESCAPE))
 	{
 		finish(0, "capture cancelled (Escape)");
 		return;
 	}
-	if ((GetAsyncKeyState(VK_BACK) & 0x8000) != 0)
+	if (key_pressed(VK_BACK))
 	{
 		finish(0, "shortcut cleared (Backspace)");
 		return;
 	}
 
-	const bool alt = (GetAsyncKeyState(VK_LMENU) & 0x8000) != 0 || (GetAsyncKeyState(VK_RMENU) & 0x8000) != 0;
-	const bool ctrl = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0 || (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
-	const bool shift = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0 || (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
+	const bool alt = key_down(VK_LMENU) || key_down(VK_RMENU) || key_down(VK_MENU);
+	const bool ctrl = key_down(VK_LCONTROL) || key_down(VK_RCONTROL) || key_down(VK_CONTROL);
+	const bool shift = key_down(VK_LSHIFT) || key_down(VK_RSHIFT) || key_down(VK_SHIFT);
 
 	for (int vk = 1; vk < 256; ++vk)
 	{
@@ -3689,7 +3728,7 @@ static void process_hotkey_capture(device_data *data)
 			continue;
 		if (is_modifier_vk(vk))
 			continue;
-		if ((GetAsyncKeyState(vk) & 0x8000) == 0)
+		if (!key_pressed(vk))
 			continue;
 
 		finish(make_hotkey(vk, alt, ctrl, shift), "");
@@ -3992,6 +4031,28 @@ static void log_watchdog(device_data *data)
 	log_info(message);
 }
 
+// -----------------------------------------------------------------------------
+// ReShade runtime 级 present：处理按键的唯一合适位置
+//
+// addon_event::present 只有 command_queue / swapchain，拿不到 effect_runtime，
+// 也就拿不到 ReShade 维护的按键状态 —— 而 GetAsyncKeyState 在"面板打开 + ImGui
+// 想吃键盘"时会被 ReShade 的 hook 屏蔽成 0（见 poll_key_edges 的注释）。
+// 这里与 ShaderToggler 的 onReshadePresent 对齐：每帧每 runtime 调用一次。
+// -----------------------------------------------------------------------------
+static void on_reshade_present(effect_runtime *runtime)
+{
+	device *const dev = runtime->get_device();
+	device_data *data = get_device_data(dev);
+	if (data == nullptr)
+		return;
+
+	poll_key_edges(runtime);
+
+	process_hotkeys(data);
+	process_hotkey_capture(data);
+	process_rule_hotkeys(data);
+}
+
 static void on_present(
 	command_queue * /*queue*/,
 	swapchain *swapchain,
@@ -4007,13 +4068,10 @@ static void on_present(
 
 	flush_command_counters(data);
 
-	// 每帧采样一次键盘边沿，供規則热键与 Hunting 键共用
-	poll_key_edges();
-
-	process_hotkeys(data);
-	process_hotkey_capture(data);
-	process_rule_hotkeys(data);
-
+	// 键盘相关逻辑移到 on_reshade_present：那里能拿到 effect_runtime，
+	// 用 ReShade 自己的按键状态（不受 GetAsyncKeyState hook 影响）。
+	// 另外注意 t_key_down/t_key_pressed 是 thread_local：同一帧里多个 runtime
+	// 连续 present 时，第二次采样得到的是"无边沿"，不会重复触发。
 	log_watchdog(data);
 
 	const bool hunting = data->hunting.load(std::memory_order_relaxed);
@@ -5139,6 +5197,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 		reshade::register_event<reshade::addon_event::push_descriptors>(on_push_descriptors);
 		reshade::register_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
 		reshade::register_event<reshade::addon_event::present>(on_present);
+		// 按键处理放在 runtime 级 present：能拿到 effect_runtime 的按键状态
+		reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
 
 		reshade::register_overlay("Texture Override", draw_overlay);
 		break;

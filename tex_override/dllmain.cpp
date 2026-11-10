@@ -178,6 +178,9 @@
  *
  *   - 只有 Hunting Mode 开启时 Numpad 1/2/3 生效。
  *   - 候选条目 = (纹理哈希, PS 哈希, VS 哈希) 三元组，面板同时展示几何参数。
+ *   - 点选候选（或用 Numpad 1/2 步进）会**立刻隐藏**该候选覆盖的绘制，
+ *     用"元素消失"确认选中项；预览与规则表完全解耦（不合成规则、不写 INI），
+ *     可随时用面板上的 Preview 开关关掉。实现见 candidate_preview（seqlock）。
  *   - Numpad 3 创建规则时自动写入当前捕获的 ps/vs 哈希与 first_index/index_count；
  *     “Include texture hash” 关闭时写 hash = *，得到纯稳定锚点规则。
  */
@@ -798,6 +801,8 @@ struct __declspec(uuid("d4e6f8a0-1b3c-4d5e-9f70-2a4c6e8b0d13")) cmd_list_data
 	uint32_t local_applied = 0;
 	uint32_t local_srv_resolved = 0;
 	uint32_t local_push_updates = 0;
+	// 因"候选预览"被跳过的绘制数（单独计数，避免污染 Skipped 的语义）
+	uint32_t local_preview_skipped = 0;
 	uint32_t last_ps_hash = 0;
 	uint32_t last_vs_hash = 0;
 
@@ -865,6 +870,10 @@ struct __declspec(uuid("6b0f4d2a-3c1e-4a7b-9f2d-1e5c8a9b0d31")) device_data
 	std::atomic<int> frames_to_collect{ 10 };
 	std::atomic<int> frames_collected{ 0 };
 	std::atomic<bool> collecting{ false };
+
+	// 候选预览（只影响渲染，不影响规则表）：勾掉后立刻取消隐藏
+	std::atomic<bool> preview_enabled{ true };
+	std::atomic<uint32_t> preview_skipped{ 0 };
 
 	// Group settings 窗口状态（仅 overlay 线程访问）
 	bool settings_open = false;
@@ -1307,6 +1316,56 @@ static std::atomic<bool> g_hunting_collecting{ false };
 // 挂机期间 push_descriptors 早退，stage_bindings 里可能残留早已销毁的 view 句柄；
 // 新纪元强制各命令列表丢弃旧绑定，避免 record_draw_candidates 解引用悬垂句柄。
 static std::atomic<uint64_t> g_hunting_collect_epoch{ 1 };
+
+// -----------------------------------------------------------------------------
+// 候选预览：把"当前选中的候选"对应的绘制临时跳过
+//
+// 目的：Numpad 1/2 只是换一个哈希数字，用户看不出画面上是哪个元素。
+// ShaderToggler / REST 的做法是步进时把当前 shader 隐藏，用"元素消失"来确认
+// 选中了什么；这里做成 draw 内的一次精确匹配（PS/VS 相等做廉价预筛，
+// 再比对绑定 SRV 的纹理哈希），语义上等于"这条候选覆盖的所有绘制"。
+//
+// 三字段 + seq 的 seqlock：overlay / present 线程写，多个 draw 线程读。
+// 读到"写了一半"就放弃本次预览——宁可少隐藏一帧，也不做错匹配。
+// -----------------------------------------------------------------------------
+struct candidate_preview
+{
+	std::atomic<uint32_t> hash{ 0 };
+	std::atomic<uint32_t> ps_hash{ 0 };
+	std::atomic<uint32_t> vs_hash{ 0 };
+	std::atomic<bool> enabled{ false };
+	std::atomic<uint32_t> seq{ 0 };
+};
+
+static candidate_preview g_preview;
+
+static void set_candidate_preview(bool enabled, uint32_t hash, uint32_t ps_hash, uint32_t vs_hash)
+{
+	g_preview.seq.fetch_add(1, std::memory_order_relaxed);
+	g_preview.hash.store(hash, std::memory_order_relaxed);
+	g_preview.ps_hash.store(ps_hash, std::memory_order_relaxed);
+	g_preview.vs_hash.store(vs_hash, std::memory_order_relaxed);
+	g_preview.enabled.store(enabled, std::memory_order_relaxed);
+	// release：保证前面几个 store 在序号变偶数之后对读侧可见
+	g_preview.seq.fetch_add(1, std::memory_order_release);
+}
+
+// 读侧：序号为奇数或前后不一致（写者正在更新）时返回 false
+static bool read_candidate_preview(uint32_t &hash, uint32_t &ps_hash, uint32_t &vs_hash)
+{
+	if (!g_preview.enabled.load(std::memory_order_relaxed))
+		return false;
+
+	const uint32_t s1 = g_preview.seq.load(std::memory_order_acquire);
+	if ((s1 & 1u) != 0)
+		return false;
+
+	hash = g_preview.hash.load(std::memory_order_relaxed);
+	ps_hash = g_preview.ps_hash.load(std::memory_order_relaxed);
+	vs_hash = g_preview.vs_hash.load(std::memory_order_relaxed);
+
+	return g_preview.seq.load(std::memory_order_acquire) == s1;
+}
 
 // push_descriptors 计数（诊断，不依赖 device_data）
 static std::atomic<uint64_t> g_push_updates{ 0 };
@@ -2774,6 +2833,8 @@ static void on_destroy_device(device *dev)
 	// 保证任何线程要么看到旧 device_data（仍存活），要么看到新 epoch 并清缓存。
 	g_texture_rules_active.store(false, std::memory_order_release);
 	g_hunting_collecting.store(false, std::memory_order_relaxed);
+	// 设备级状态全部失效：候选预览也要清掉，否则新设备会继续隐藏旧哈希
+	set_candidate_preview(false, 0, 0, 0);
 	// 设备级资源全部失效：descriptor / 像素哈希缓存必须整体作废
 	g_resource_hash_epoch.fetch_add(1, std::memory_order_relaxed);
 	g_pixel_reset_epoch.fetch_add(1, std::memory_order_relaxed);
@@ -2961,6 +3022,79 @@ static void record_draw_candidates(
 		data->frame_candidates[pending[i].key] = pending[i].value;
 }
 
+// -----------------------------------------------------------------------------
+// 候选预览匹配
+//
+// 只有 hunting 预览开启、且本次 draw 的 PS/VS 与候选一致时才走到这里
+// （两字段比较，绝大多数 draw 一次就退出）。命中判定：任意绑定 SRV 的纹理
+// 哈希等于候选哈希——与慢速通道共用同一份 bound_entry / 线程局部缓存，
+// 不额外产生 GetDesc。
+//
+// 语义上等于"这条候选覆盖的所有绘制"，因此同一纹理+同一 shader 的多个 draw
+// 会一起消失，这正是预览想要的：让用户看到候选覆盖了哪块画面。
+// -----------------------------------------------------------------------------
+static bool preview_covers_draw(
+	device *dev,
+	device_data *data,
+	cmd_list_data *cmd_data,
+	bool pixel_mode,
+	const draw_context &ctx)
+{
+	uint32_t target_hash = 0;
+	uint32_t target_ps = 0;
+	uint32_t target_vs = 0;
+
+	if (!read_candidate_preview(target_hash, target_ps, target_vs))
+		return false;
+
+	// 候选记录时的稳定锚点必须一致（0 表示当时没抓到，按严格相等处理）
+	if (target_ps != ctx.ps_hash || target_vs != ctx.vs_hash)
+		return false;
+
+	for (int stage = 0; stage < stage_count; ++stage)
+	{
+		stage_bindings &binding = cmd_data->stages[stage];
+
+		for (uint16_t i = 0; i < binding.active_count; ++i)
+		{
+			bound_entry &entry = binding.active[i].second;
+			const UINT slot = binding.active[i].first;
+			const resource_view view = entry.view;
+			if (view.handle == 0)
+				continue;
+
+			uint32_t hash = 0;
+			if (pixel_mode)
+			{
+				hash = entry.pixel_hash;
+				if (hash == 0)
+				{
+					hash = lookup_pixel_hash(data, dev, view);
+					if (hash != 0)
+					{
+						entry.pixel_hash = hash;
+						binding.slots[slot].pixel_hash = hash;
+					}
+				}
+			}
+			else
+			{
+				hash = entry.descriptor_hash;
+				if (hash == 0)
+				{
+					hash = resolve_descriptor_hash(dev, view);
+					entry.descriptor_hash = hash;
+				}
+			}
+
+			if (hash != 0 && hash == target_hash)
+				return true;
+		}
+	}
+
+	return false;
+}
+
 static bool on_draw_indexed(
 	command_list *cmd_list,
 	uint32_t index_count,
@@ -2978,9 +3112,11 @@ static bool on_draw_indexed(
 	const bool collecting = hunting && data->collecting.load(std::memory_order_relaxed);
 	const rule_table *rules = acquire_rules(data);
 	const bool has_rules = rules != nullptr && !rules->rules.empty();
+	// 预览开启时即使没有规则、也不在采集，仍需进入匹配（否则点了候选没反应）
+	const bool preview_on = g_preview.enabled.load(std::memory_order_relaxed);
 
-	// 1) 没规则且不在采集：立即返回（此时连 hash mode 都不读）
-	if (!has_rules && !collecting)
+	// 1) 没规则、不在采集、也没开预览：立即返回（此时连 hash mode 都不读）
+	if (!has_rules && !collecting && !preview_on)
 		return false;
 
 	const bool pixel_mode =
@@ -3022,10 +3158,25 @@ static bool on_draw_indexed(
 		}
 	}
 
+	// 2) 候选预览：把当前选中的候选隐藏掉，让用户"看见"它对应哪块画面。
+	//    必须先于规则判定，且只在绑定表处于当前纪元时可用（否则句柄可能悬垂）。
+	//    预览只是观察手段：退出 Hunting 时会被清除，不会污染规则表。
+	//    注意不能放在 has_rules 判断之后——纯狩猎（还没有任何规则）时也要能预览。
+	if (preview_on && hunting && hunting_epoch_matches(cmd_data))
+	{
+		revalidate_view_bindings(cmd_data);
+
+		if (preview_covers_draw(dev, data, cmd_data, pixel_mode, ctx))
+		{
+			++cmd_data->local_preview_skipped;
+			return true;
+		}
+	}
+
 	if (!has_rules)
 		return false;
 
-	// 2) 特快通道：hash = * 规则。
+	// 3) 特快通道：hash = * 规则。
 	//    预过滤已在 pipeline 解析后完成：绝大多数 3D shader 的 count 为 0，
 	//    这里只有一次字节比较就跳过，完全不看纹理、也不比对 shader 哈希。
 	refresh_wildcard_prefilter(rules, cmd_data);
@@ -3304,6 +3455,14 @@ static void process_hotkeys(device_data *data)
 		data->candidate_index = (data->candidate_index - 1 + count) % count;
 	if (next_key)
 		data->candidate_index = (data->candidate_index + 1) % count;
+
+	// 步进的同时更新预览：用"元素消失"确认选中了什么（与点列表等价）
+	if (data->preview_enabled.load(std::memory_order_relaxed) &&
+		data->candidate_index >= 0 && data->candidate_index < count)
+	{
+		const candidate &selected = data->candidates[data->candidate_index];
+		set_candidate_preview(true, selected.hash, selected.ps_hash, selected.vs_hash);
+	}
 }
 
 static void restart_candidate_collection(device_data *data)
@@ -3316,6 +3475,9 @@ static void restart_candidate_collection(device_data *data)
 	data->candidate_index = -1;
 	data->frames_collected.store(0, std::memory_order_relaxed);
 	data->collecting.store(true, std::memory_order_relaxed);
+
+	// 候选全部重建，旧的预览目标已不存在
+	set_candidate_preview(false, 0, 0, 0);
 
 	// 新纪元：先推进 epoch，再打开采集。各命令列表会在下一次 push/draw 时
 	// 丢弃挂机期间残留的陈旧 view 句柄，避免解引用已销毁的 SRV。
@@ -3387,6 +3549,11 @@ static void flush_command_counters(device_data *data)
 		{
 			g_push_updates.fetch_add(cmd->local_push_updates, std::memory_order_relaxed);
 			cmd->local_push_updates = 0;
+		}
+		if (cmd->local_preview_skipped != 0)
+		{
+			data->preview_skipped.fetch_add(cmd->local_preview_skipped, std::memory_order_relaxed);
+			cmd->local_preview_skipped = 0;
 		}
 		if (cmd->last_ps_hash != 0 || cmd->last_vs_hash != 0)
 		{
@@ -3476,6 +3643,10 @@ static void on_present(
 	log_watchdog(data);
 
 	const bool hunting = data->hunting.load(std::memory_order_relaxed);
+
+	// Hunting 关闭时清掉预览，避免"退出狩猎后画面还少一块"
+	if (!hunting)
+		set_candidate_preview(false, 0, 0, 0);
 
 	{
 		std::lock_guard<std::mutex> lock(data->mutex);
@@ -3589,6 +3760,8 @@ static void draw_overlay(effect_runtime *runtime)
 		uint32_t last_vs_hash = 0;
 		bool stable_only = true;
 		bool safe_mode = false;
+		bool preview_enabled = true;
+		uint32_t preview_skipped = 0;
 		uint32_t resolved = 0;
 		uint32_t applied = 0;
 		uint32_t draws = 0;
@@ -3617,6 +3790,8 @@ static void draw_overlay(effect_runtime *runtime)
 		snapshot.last_vs_hash = data->last_vs_hash.load(std::memory_order_relaxed);
 		snapshot.stable_only = data->stable_only_rules.load(std::memory_order_relaxed);
 		snapshot.safe_mode = data->safe_mode.load(std::memory_order_relaxed);
+		snapshot.preview_enabled = data->preview_enabled.load(std::memory_order_relaxed);
+		snapshot.preview_skipped = data->preview_skipped.load(std::memory_order_relaxed);
 		snapshot.resolved = data->srv_resolved.load(std::memory_order_relaxed);
 		snapshot.applied = data->rules_applied.load(std::memory_order_relaxed);
 		snapshot.draws = data->draws_seen.load(std::memory_order_relaxed);
@@ -3666,6 +3841,11 @@ static void draw_overlay(effect_runtime *runtime)
 			select_hash = snapshot.candidates[index].hash;
 			select_ps = snapshot.candidates[index].ps_hash;
 			select_vs = snapshot.candidates[index].vs_hash;
+
+			// 选中即预览：把这条候选对应的绘制立刻隐藏，用"元素消失"确认它是什么。
+			// 原子写 + seqlock，draw 线程随时可读，不需要走"意图 + 帧末落实"的路径。
+			if (snapshot.preview_enabled && snapshot.hunting)
+				set_candidate_preview(true, select_hash, select_ps, select_vs);
 		}
 	};
 
@@ -3788,6 +3968,28 @@ static void draw_overlay(effect_runtime *runtime)
 		ImGui::SameLine();
 		if (ImGui::Button("Add/Remove rule (Numpad 3)") && snapshot.hunting && has_candidate)
 			toggle_requested = true;
+
+		// 预览开关：开时"点选/步进候选"会立刻把对应绘制隐藏，靠元素消失来确认选中项。
+		bool preview_enabled = snapshot.preview_enabled;
+		if (ImGui::Checkbox("Preview selected (hide it live)", &preview_enabled))
+		{
+			data->preview_enabled.store(preview_enabled, std::memory_order_relaxed);
+
+			if (!preview_enabled)
+			{
+				set_candidate_preview(false, 0, 0, 0);
+			}
+			else if (snapshot.hunting && has_candidate)
+			{
+				const candidate &selected = snapshot.candidates[view_index];
+				set_candidate_preview(true, selected.hash, selected.ps_hash, selected.vs_hash);
+			}
+		}
+		if (snapshot.hunting && snapshot.preview_skipped != 0)
+		{
+			ImGui::SameLine();
+			ImGui::TextDisabled("preview hidden: %u draw(s)", snapshot.preview_skipped);
+		}
 
 		if (has_candidate)
 		{
@@ -4115,13 +4317,15 @@ static void draw_overlay(effect_runtime *runtime)
 		if (hud_open)
 		{
 			ImGui::TextUnformatted("Hunting Mode: ON");
-			ImGui::TextUnformatted("Numpad 1 / 2: Prev / Next");
-			ImGui::TextUnformatted("Numpad 3: Toggle Rule");
 
 			const bool has_candidate = view_index >= 0 && view_index < candidate_count;
 			if (has_candidate)
 			{
 				const candidate &selected = snapshot.candidates[view_index];
+				// 让用户知道"画面少一块"是预览，而不是规则/插件出错
+				if (snapshot.preview_enabled)
+					ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "PREVIEW: candidate hidden");
+
 				ImGui::Text("tex: 0x%08X", selected.hash);
 				ImGui::Text("ps:  0x%08X", selected.ps_hash);
 				ImGui::Text("vs:  0x%08X", selected.vs_hash);
@@ -4132,6 +4336,8 @@ static void draw_overlay(effect_runtime *runtime)
 				ImGui::TextUnformatted("Current: (none)");
 			}
 
+			ImGui::TextUnformatted("Numpad 1 / 2: Prev / Next");
+			ImGui::TextUnformatted("Numpad 3: Toggle Rule");
 			ImGui::TextDisabled("Drag to move");
 		}
 
@@ -4166,6 +4372,10 @@ static void draw_overlay(effect_runtime *runtime)
 			data->collecting.store(false, std::memory_order_relaxed);
 			g_hunting_collecting.store(false, std::memory_order_relaxed);
 		}
+
+		// 退出 Hunting：立刻取消预览，否则画面上会一直少一块
+		if (!hunting_value)
+			set_candidate_preview(false, 0, 0, 0);
 	}
 
 	if (restart_requested && data->hunting.load(std::memory_order_relaxed))
@@ -4189,6 +4399,8 @@ static void draw_overlay(effect_runtime *runtime)
 
 		if (data->hunting.load(std::memory_order_relaxed))
 			restart_candidate_collection(data);
+		else
+			set_candidate_preview(false, 0, 0, 0); // 候选已清空，预览目标不再有效
 
 		log_info(new_hash_mode == static_cast<int>(hash_mode::pixel)
 			? "[Hash] switched to pixel content hash (only textures uploaded through the CPU have a hash)"

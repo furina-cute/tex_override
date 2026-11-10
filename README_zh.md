@@ -175,6 +175,7 @@ tex_override\bin\x64\Release\tex_override.addon64
 - `Stable-only new rules (hash = *)`：勾选时 Numpad 3 生成不依赖纹理哈希的规则（默认开启）。
 - `Pixel hashes: N texture(s), X MB hashed`：像素哈希采集情况；为 0 时会提示原因。
 - 候选列表：进入 Hunting 后累积 `Frames to collect` 帧的候选并集，随后**冻结**；每条候选显示 `纹理哈希 / PS 哈希 / VS 哈希 / fi / ic`。
+  - **点选即预览**：点某一行（或用 Numpad 1/2 步进）会立刻把该候选对应的绘制**隐藏**，用"元素消失"确认它是哪一块画面，再按 Numpad 3 落规则。开关是候选列表上方的 `Preview selected (hide it live)`（默认开）；旁边的 `preview hidden: N draw(s)` 是预览跳过的绘制数（不计入 `Skipped`）。
 - Rules 表格：`Tex / PS / VS / FI / IC / Mode / Act / Set / Del`。
 - 底部：`Save to INI` / `Reload from INI`；存在未保存修改时显示黄色 `(Unsaved)`。
 - 窗口默认尺寸会随分辨率收缩（屏幕高 < 600 或宽 < 800 时按 0.8 缩放）。
@@ -185,14 +186,14 @@ tex_override\bin\x64\Release\tex_override.addon64
 >
 > **优先级**：通配符规则（`hash = *`）命中即**立即返回**，优先级绝对高于任何带纹理哈希的规则——即使后者的 `match_priority` 更高。若需要两者共存，请把纹理规则也改成通配符形式（用 `match_ps_hash` + 几何条件区分）。
 
-HUD 悬浮窗：Hunting 开启时显示在可配置位置，半透明背景，显示当前候选的纹理/PS/VS 哈希与绘制范围。可以直接用鼠标拖拽 HUD；拖拽后的坐标会同步回主面板的 `HUD X / HUD Y` 滑块。`HUD Alpha` 控制透明度。
+HUD 悬浮窗：Hunting 开启时显示在可配置位置，半透明背景，显示当前候选的纹理/PS/VS 哈希与绘制范围。预览开启且已选中候选时，HUD 顶部会显示黄色 `PREVIEW: candidate hidden`，避免把"画面少一块"误认为插件故障。可以直接用鼠标拖拽 HUD；拖拽后的坐标会同步回主面板的 `HUD X / HUD Y` 滑块。`HUD Alpha` 控制透明度。
 
 ### 3.4 热键
 
 | 按键 | 条件 | 功能 |
 |---|---|---|
-| `Numpad 1` | Hunting Mode 开启 | 上一个候选 |
-| `Numpad 2` | Hunting Mode 开启 | 下一个候选 |
+| `Numpad 1` | Hunting Mode 开启 | 上一个候选（同时刷新预览） |
+| `Numpad 2` | Hunting Mode 开启 | 下一个候选（同时刷新预览） |
 | `Numpad 3` | Hunting Mode 开启 | 添加/删除当前候选的规则 |
 
 Hunting Mode 关闭时数字键完全无效。Hunting 关闭且规则为空时，`draw_indexed` 直接返回，不做任何绑定扫描。
@@ -220,6 +221,7 @@ Hunting Mode 关闭时数字键完全无效。Hunting 关闭且规则为空时�
   - `tests/view_binding_test.cpp` 用 4 个绑定/绘制线程 + 30 万次销毁重建（句柄池仅 64 个）验证。
 - **跨 API 兼容**：`on_init_device` 用 `device::get_api()` 记录 `device_data::is_d3d11`。非 D3D11 时：`resolve_descriptor_hash` 直接返回 0（不做任何原生强转），`replace` 在决策点降级为 `skip` 并只警告一次；shader 哈希 / 通配符匹配不受影响。
 - **零锁热路径**：descriptor hash / pixel hash / shader hash 全部线程局部缓存 + 全局 epoch；`push_descriptors` / `draw_indexed` 中没有任何加锁。规则表发布为不可变快照（`std::atomic<const rule_table*>`），写时复制整体替换。
+- **候选预览**：hunting 时"点选/步进候选 → 立刻隐藏对应绘制"，用元素消失确认选中项（等价于 ShaderToggler/REST 的"步进即隐藏"）。实现是一个 32 位 seqlock（`candidate_preview`：hash / ps / vs / enabled + 序号），overlay 与 present 线程写、draw 线程读，读到写一半就放弃本帧预览，绝不做错匹配。匹配时先用 PS/VS 两个字段做廉价预筛（绝大多数 draw 一次比较就退出），命中同 shader 才遍历绑定 SRV，并复用慢速通道的 `bound_entry` / 线程局部哈希缓存，不额外产生 `GetDesc`。语义上等于"这条候选覆盖的所有绘制"，因此同一纹理+同一 shader 的多个 draw 会一起隐藏；预览与规则表完全解耦（没有合成规则、不写 INI），退出 Hunting 或清空候选时自动解除。它要求绑定表处于当前狩猎纪元（否则句柄可能悬垂），并且**优先于规则判定**——预览期间被隐藏的绘制不会再走规则匹配。
 - **像素哈希**：在 `init_resource`（有 `initial_data`）与 `update_texture_region`（CPU 上传）中计算，**与当前 hash_mode 无关**，因此运行中切换模式仍能看到已加载纹理；每张纹理最多扫描 512 KiB，超出按固定步长抽行；draw 中没有任何 `CopyResource` / `Map` 回读。
 - **候选冻结**：进入 Hunting 或点 `Refresh` 后，累积 `Frames to collect` 帧的候选并集，达到目标后停止采集并冻结列表。候选键是 `(纹理哈希, PS 哈希, VS 哈希)` 三元组。
 - **候选批量插入**：`record_draw_candidates` 先在栈上收集（固定 32 项，无堆分配），一次 `lock_guard` 批量写入 `frame_candidates`，一个 draw 只抢一次锁。
